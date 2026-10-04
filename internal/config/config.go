@@ -118,6 +118,9 @@ type Config struct {
 	// ID Generation
 	IDGen IDGenConfig `yaml:"idgen"`
 
+	// MB Wallet deadline gate
+	DeadlineGate DeadlineGateConfig `yaml:"deadline_gate"`
+
 	// Retention
 	ClickHouseLogRetentionTTLDays int `yaml:"clickhouse_log_retention_ttl_days" env:"CLICKHOUSE_LOG_RETENTION_TTL_DAYS" desc:"Days to retain logs in ClickHouse. 0 = unlimited." required:"N"`
 }
