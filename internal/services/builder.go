@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/hookdeck/outpost/internal/alert"
 	apirouter "github.com/hookdeck/outpost/internal/apirouter"
 	"github.com/hookdeck/outpost/internal/config"
+	"github.com/hookdeck/outpost/internal/deadlinegate"
 	"github.com/hookdeck/outpost/internal/deliverymq"
 	"github.com/hookdeck/outpost/internal/destregistry"
 	destregistrydefault "github.com/hookdeck/outpost/internal/destregistry/providers"
@@ -184,6 +186,27 @@ func (b *ServiceBuilder) BuildAPIWorkers(baseRouter *gin.Engine) error {
 
 	// Initialize event handler and create API router
 	b.logger.Debug("creating event handler and API router")
+
+	// MB Wallet's deadline gate fronts the whole API. A publish queue would deliver
+	// publishes that never pass through it, so the API refuses to start with one.
+	if b.cfg.PublishMQ.GetQueueConfig() != nil {
+		return errors.New("deadline gate: a publish queue would bypass the gate; unset the PUBLISH_* queue settings")
+	}
+	gateDB, err := deadlinegate.NewPG(b.ctx, b.cfg.DeadlineGate.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	svc.cleanupFuncs = append(svc.cleanupFuncs, func(ctx context.Context, logger *logging.LoggerWithCtx) { gateDB.Close() })
+	gate, err := deadlinegate.New(
+		b.cfg.DeadlineGate.Secret,
+		b.cfg.DeadlineGate.PreviousSecret,
+		time.Duration(b.cfg.DeadlineGate.RequestTimeoutMs)*time.Millisecond,
+		gateDB,
+	)
+	if err != nil {
+		return err
+	}
+
 	publishIdempotence := idempotence.New(svc.redisClient,
 		idempotence.WithTimeout(5*time.Second),
 		idempotence.WithSuccessfulTTL(time.Duration(b.cfg.PublishIdempotencyKeyTTL)*time.Second),
@@ -231,7 +254,7 @@ func (b *ServiceBuilder) BuildAPIWorkers(baseRouter *gin.Engine) error {
 	)
 
 	// Mount API handler onto base router (everything except /healthz goes to apiHandler)
-	baseRouter.NoRoute(gin.WrapH(apiHandler))
+	baseRouter.NoRoute(gin.WrapH(gate.Wrap(apiHandler)))
 
 	svc.router = baseRouter
 
