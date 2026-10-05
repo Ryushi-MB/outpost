@@ -2,7 +2,6 @@ package services
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -117,6 +116,10 @@ func (b *ServiceBuilder) createHTTPServer(router http.Handler) error {
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", b.cfg.APIPort),
 		Handler: router,
+		// The deadline gate reads a call's whole body before it can check the signature.
+		// Bound that read in time as the gate bounds it in size: a call that cannot send
+		// its request within the gate's request timeout could not be admitted anyway.
+		ReadTimeout: time.Duration(b.cfg.DeadlineGate.RequestTimeoutMs) * time.Millisecond,
 	}
 
 	// Register HTTP server worker
@@ -187,12 +190,9 @@ func (b *ServiceBuilder) BuildAPIWorkers(baseRouter *gin.Engine) error {
 	// Initialize event handler and create API router
 	b.logger.Debug("creating event handler and API router")
 
-	// MB Wallet's deadline gate fronts the whole API. A publish queue would deliver
-	// publishes that never pass through it, so the API refuses to start with one.
-	if b.cfg.PublishMQ.GetQueueConfig() != nil {
-		return errors.New("deadline gate: a publish queue would bypass the gate; unset the PUBLISH_* queue settings")
-	}
-	gateDB, err := deadlinegate.NewPG(b.ctx, b.cfg.DeadlineGate.DatabaseURL)
+	// MB Wallet's deadline gate fronts the whole API. The publish queue consumer is gone:
+	// config validation refuses a publish queue, which would bypass the gate.
+	gateDB, err := deadlinegate.NewPG(b.ctx, b.cfg.DeadlineGate.DatabaseURL, b.cfg.DeadlineGate.LocalPlaintext)
 	if err != nil {
 		return err
 	}
@@ -261,24 +261,6 @@ func (b *ServiceBuilder) BuildAPIWorkers(baseRouter *gin.Engine) error {
 	// Worker 1: RetryMQ Consumer
 	retryWorker := NewRetryMQWorker(svc.retryScheduler, b.logger)
 	b.supervisor.Register(retryWorker)
-
-	// Worker 2: PublishMQ Consumer (optional)
-	if publishQueueConfig := b.cfg.PublishMQ.GetQueueConfig(); publishQueueConfig != nil {
-		if b.cfg.PublishMQ.ProxyIgnored() {
-			b.logger.Info("PUBLISH_PROXY_URL is ignored: only the RabbitMQ publish queue connects through a proxy",
-				zap.String("publishmq_type", b.cfg.PublishMQ.GetInfraType()))
-		}
-		publishMQ := publishmq.New(publishmq.WithQueue(publishQueueConfig))
-		messageHandler := publishmq.NewMessageHandler(eventHandler)
-		publishMQWorker := NewConsumerWorker(
-			"publishmq-consumer",
-			publishMQ.Subscribe,
-			messageHandler,
-			b.cfg.PublishMaxConcurrency,
-			b.logger,
-		)
-		b.supervisor.Register(publishMQWorker)
-	}
 
 	b.logger.Info("API service workers built successfully")
 	return nil

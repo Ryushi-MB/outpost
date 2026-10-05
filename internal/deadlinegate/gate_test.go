@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -175,6 +176,9 @@ func TestGateRules(t *testing.T) {
 			c.target += "?tenant_id=other"
 			return c
 		}(), decision: admitAll, want: refusedUnread},
+		// The query is signed too. This query names no tenant, so only the signature can
+		// catch it.
+		{name: "query added to a signed publish, tenant untouched", call: func() call { c := good; c.target += "?x=1"; return c }(), decision: admitAll, want: refusedUnread},
 		{name: "re-kinded", call: good.with(HeaderCallKind, "republish"), decision: admitAll, want: refusedUnread},
 		{name: "re-dated", call: good.with(HeaderDeadline, "2026-10-05T12:00:00.123457Z"), decision: admitAll, want: refusedUnread},
 		{name: "other start record", call: good.with(HeaderStartRecord, "0b5f1e2a-7c3d-4e8f-9a1b-2c3d4e5f6a7c"), decision: admitAll, want: refusedUnread},
@@ -214,6 +218,7 @@ func TestGateRules(t *testing.T) {
 
 		// The tenant the call acts on must be one the gate can name and compare.
 		{name: "publish without tenant_id", call: signed(keyCurrent, "POST", "/api/v1/publish", `{"topic":"t"}`, "publish"), decision: admitAll, want: refusedUnread},
+		{name: "publish with an empty tenant_id", call: signed(keyCurrent, "POST", "/api/v1/publish", `{"tenant_id":"","topic":"t"}`, "publish"), decision: admitAll, want: refusedUnread},
 		{name: "publish body not JSON", call: signed(keyCurrent, "POST", "/api/v1/publish", "tenant_id="+tenant, "publish"), decision: admitAll, want: refusedUnread},
 		{name: "publish tenant_id not a string", call: signed(keyCurrent, "POST", "/api/v1/publish", `{"tenant_id":7}`, "publish"), decision: admitAll, want: refusedUnread},
 		{name: "publish with a case-folded second tenant_id", call: signed(keyCurrent, "POST", "/api/v1/publish", `{"tenant_id":"`+tenant+`","TENANT_ID":"`+org+`:test"}`, "publish"), decision: admitAll, want: outcome{status: 200, reached: true, admitted: true}, tenant: org + ":test"},
@@ -247,6 +252,56 @@ func TestBodyOverLimitIsRefused(t *testing.T) {
 	got, _ := run(t, newGate(t, a, "", 10*time.Second), a, signed(keyCurrent, "POST", "/api/v1/publish", body, "publish"))
 	if got.reached || got.admitted || got.status != http.StatusRequestEntityTooLarge {
 		t.Fatalf("got %+v, want 413 with no read and nothing reached", got)
+	}
+}
+
+// Each route a signed call may take admits only the call kinds MB Wallet sends on it
+// (spec "Deadline gate"); every other pairing is refused before the read, so a start
+// record of one kind, admitted by the database for that kind, cannot carry another call.
+func TestSignedKindMustFitTheRoute(t *testing.T) {
+	kinds := []string{"publish", "redrive", "republish", "proxied_mutation", "job_disable", "job_list", "job_enable"}
+	tenantPath := "/api/v1/tenants/" + tenant
+	destPath := tenantPath + "/destinations"
+	routes := []struct {
+		method, target, body string
+		allowed              []string
+	}{
+		{"POST", "/api/v1/publish", publishBody, []string{"publish", "redrive", "republish"}},
+		{"PUT", tenantPath, "", []string{"proxied_mutation"}},
+		{"DELETE", tenantPath, "", []string{"proxied_mutation"}},
+		{"GET", destPath, "", []string{"job_list"}},
+		{"POST", destPath, `{"type":"webhook","topics":["*"]}`, []string{"proxied_mutation"}},
+		{"PATCH", destPath + "/des_1", `{"topics":["*"]}`, []string{"proxied_mutation"}},
+		{"DELETE", destPath + "/des_1", "", []string{"proxied_mutation"}},
+		{"PUT", destPath + "/des_1/enable", "", []string{"job_enable", "proxied_mutation"}},
+		{"PUT", destPath + "/des_1/disable", "", []string{"job_disable", "proxied_mutation"}},
+		// Signed calls on routes MB Wallet never signs for: refused whatever the kind.
+		{"POST", "/api/v1/retry", `{"event_id":"e","destination_id":"des_1"}`, nil},
+		{"GET", tenantPath, "", nil},
+		{"GET", destPath + "/des_1", "", nil},
+		{"GET", tenantPath + "/token", "", nil},
+		{"GET", tenantPath + "/portal", "", nil},
+		{"PUT", destPath + "/des_1/enable/x", "", nil},
+		{"PUT", destPath + "//disable", "", nil},
+	}
+	for _, rt := range routes {
+		for _, kind := range kinds {
+			allowed := slices.Contains(rt.allowed, kind)
+			t.Run(rt.method+" "+rt.target+" as "+kind, func(t *testing.T) {
+				a := &fakeAdmitter{decision: Decision{Admit: true, RequestTimeout: 10 * time.Second}}
+				got, a := run(t, newGate(t, a, "", 10*time.Second), a, signed(keyCurrent, rt.method, rt.target, rt.body, kind))
+				want := outcome{status: http.StatusForbidden}
+				if allowed {
+					want = outcome{status: http.StatusOK, reached: true, admitted: true}
+				}
+				if got != want {
+					t.Fatalf("got %+v, want %+v", got, want)
+				}
+				if allowed && (len(a.calls) != 1 || a.calls[0].Kind != kind || a.calls[0].Tenant != tenant) {
+					t.Fatalf("admission read asked %+v, want kind %s for tenant %s", a.calls, kind, tenant)
+				}
+			})
+		}
 	}
 }
 
@@ -307,11 +362,33 @@ func TestAdmittedCallIsCutOffAtTheSmallerTimeout(t *testing.T) {
 	}
 }
 
-func TestReadThatOutlastsTheTimeoutAdmitsNothing(t *testing.T) {
-	a := &fakeAdmitter{decision: Decision{Admit: true, RequestTimeout: 100 * time.Millisecond}, delay: 150 * time.Millisecond}
-	got, _ := run(t, newGate(t, a, "", 10*time.Second), a, signed(keyCurrent, "POST", "/api/v1/publish", publishBody, "publish"))
-	if got.reached || got.status == http.StatusOK {
-		t.Fatalf("got %+v: a call whose time ran out during the read reached the service", got)
+// A call whose stored timeout was spent by the time the read answered must not start the
+// service at all. The service runs on its own goroutine under the cut-off, so the test
+// waits for a start that could come after the gate has answered.
+func TestReadThatOutlastsTheTimeoutStartsNothing(t *testing.T) {
+	const runs = 20
+	started := make(chan struct{}, runs)
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	})
+	for i := 0; i < runs; i++ {
+		a := &fakeAdmitter{decision: Decision{Admit: true, RequestTimeout: 20 * time.Millisecond}, delay: 40 * time.Millisecond}
+		c := signed(keyCurrent, "POST", "/api/v1/publish", publishBody, "publish")
+		req := httptest.NewRequest(c.method, c.target, strings.NewReader(c.body))
+		for k, vs := range c.headers {
+			req.Header[k] = vs
+		}
+		rec := httptest.NewRecorder()
+		newGate(t, a, "", 10*time.Second).Wrap(next).ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("run %d: status %d, want 503", i, rec.Code)
+		}
+	}
+	select {
+	case <-started:
+		t.Fatal("the service started for a call whose request timeout was spent before admission")
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 

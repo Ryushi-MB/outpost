@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -40,10 +41,27 @@ const (
 	minSecretBytes = 32
 )
 
-// The call kinds of the spec; anything else is refused before the database read.
-var callKinds = map[string]bool{
-	"publish": true, "redrive": true, "republish": true, "proxied_mutation": true,
-	"job_disable": true, "job_list": true, "job_enable": true,
+// signedRoutes are the only Outpost API routes a signed call may take, each with the call
+// kinds that may be signed for it. A route segment ":tenant" is the tenant the call acts
+// on and ":id" any one destination id; the publish route takes its tenant from the body.
+// A redrive and a reconciliation republish are publishes under a new publish id. Any other
+// route, or a kind not listed for its route, is refused before the database read, so a
+// start record written for one kind of call cannot carry another (an enable signed as a
+// job_list, say).
+var signedRoutes = []struct {
+	method string
+	path   []string // the segments after /api/v1/
+	kinds  []string
+}{
+	{http.MethodPost, []string{"publish"}, []string{"publish", "redrive", "republish"}},
+	{http.MethodPut, []string{"tenants", ":tenant"}, []string{"proxied_mutation"}},
+	{http.MethodDelete, []string{"tenants", ":tenant"}, []string{"proxied_mutation"}},
+	{http.MethodGet, []string{"tenants", ":tenant", "destinations"}, []string{"job_list"}},
+	{http.MethodPost, []string{"tenants", ":tenant", "destinations"}, []string{"proxied_mutation"}},
+	{http.MethodPatch, []string{"tenants", ":tenant", "destinations", ":id"}, []string{"proxied_mutation"}},
+	{http.MethodDelete, []string{"tenants", ":tenant", "destinations", ":id"}, []string{"proxied_mutation"}},
+	{http.MethodPut, []string{"tenants", ":tenant", "destinations", ":id", "enable"}, []string{"job_enable", "proxied_mutation"}},
+	{http.MethodPut, []string{"tenants", ":tenant", "destinations", ":id", "disable"}, []string{"job_disable", "proxied_mutation"}},
 }
 
 var startRecordID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -155,22 +173,46 @@ func canonicalDeadline(s string) bool {
 	return err == nil && t.UTC().Format(DeadlineLayout) == s
 }
 
-// tenantOf names the Outpost tenant a call acts on, read the way Outpost's router and
-// handlers read it, or reports that the call names none the gate can compare.
-func tenantOf(r *http.Request, body []byte) (string, bool) {
+// tenantOf names the Outpost tenant a signed call acts on, read the way Outpost's router
+// and handlers read it, and reports false when the call's route is not one of
+// signedRoutes, the kind is not one listed for it, or the call names no tenant the gate
+// can compare. /retry names a destination and no tenant, so it is not a signed route.
+func tenantOf(r *http.Request, body []byte, kind string) (string, bool) {
+	rest, ok := strings.CutPrefix(r.URL.Path, "/api/v1/")
+	if !ok {
+		return "", false
+	}
+	segments := strings.Split(rest, "/")
 	var tenant string
-	switch rest, isTenantRoute := strings.CutPrefix(r.URL.Path, "/api/v1/tenants/"); {
-	case isTenantRoute:
-		tenant, _, _ = strings.Cut(rest, "/")
-	case r.URL.Path == "/api/v1/publish":
+	matched := false
+	for _, route := range signedRoutes {
+		if route.method != r.Method || len(route.path) != len(segments) || !slices.Contains(route.kinds, kind) {
+			continue
+		}
+		tenant, matched = "", true
+		for i, want := range route.path {
+			switch {
+			case segments[i] == "":
+				matched = false
+			case want == ":tenant":
+				tenant = segments[i]
+			case want != ":id" && want != segments[i]:
+				matched = false
+			}
+		}
+		if matched {
+			break
+		}
+	}
+	if !matched {
+		return "", false
+	}
+	if r.URL.Path == "/api/v1/publish" {
 		t, ok := bodyTenant(body)
 		if !ok || t == nil {
 			return "", false
 		}
 		tenant = *t
-	default:
-		// /retry names a destination and no tenant; every other route names none either.
-		return "", false
 	}
 	if tenant == "" {
 		return "", false
@@ -244,13 +286,13 @@ func (g *Gate) Wrap(next http.Handler) http.Handler {
 			refuse(w, http.StatusForbidden, "signature does not verify")
 			return
 		}
-		if !callKinds[h.kind] || !canonicalDeadline(h.deadline) || !startRecordID.MatchString(h.startRecord) {
-			refuse(w, http.StatusForbidden, "malformed call kind, deadline or start record")
+		if !canonicalDeadline(h.deadline) || !startRecordID.MatchString(h.startRecord) {
+			refuse(w, http.StatusForbidden, "malformed deadline or start record")
 			return
 		}
-		tenant, ok := tenantOf(r, body)
+		tenant, ok := tenantOf(r, body, h.kind)
 		if !ok {
-			refuse(w, http.StatusForbidden, "call names no tenant the gate can compare")
+			refuse(w, http.StatusForbidden, "call kind not allowed on this route, or no tenant the gate can compare")
 			return
 		}
 

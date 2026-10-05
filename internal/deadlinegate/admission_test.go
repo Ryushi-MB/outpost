@@ -2,8 +2,12 @@ package deadlinegate
 
 import (
 	"context"
+	"io"
+	"net"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +22,7 @@ import (
 //
 //	MB_GATE_TEST_ADMIN_URL  a superuser or owner URL of the stack database
 //	MB_GATE_TEST_GATE_URL   the same database as mbwallet_neon_webhook_gate
+//	MB_GATE_TEST_STANDBY_URL  a streaming standby of that database, as mbwallet_neon_webhook_gate
 func gateDatabases(t *testing.T) (*pgxpool.Pool, *PG) {
 	t.Helper()
 	adminURL, gateURL := os.Getenv("MB_GATE_TEST_ADMIN_URL"), os.Getenv("MB_GATE_TEST_GATE_URL")
@@ -30,7 +35,7 @@ func gateDatabases(t *testing.T) (*pgxpool.Pool, *PG) {
 		t.Fatalf("admin pool: %v", err)
 	}
 	t.Cleanup(admin.Close)
-	gate, err := NewPG(ctx, gateURL)
+	gate, err := NewPG(ctx, gateURL, true)
 	if err != nil {
 		t.Fatalf("gate pool: %v", err)
 	}
@@ -49,14 +54,15 @@ type accessRow struct {
 
 type startRecord struct {
 	kind         string
+	mode         string        // the stored mode; "" is live
 	deadlineIn   time.Duration // D relative to the database clock; negative is past
 	accessState  string
 	marker       string
 	staleToken   bool // lease token one below the stop job's current token
 	timeoutMs    int
-	opposite     bool // ask about the opposite mode's tenant
-	otherAgency  bool // ask about another agency's tenant
-	upperTenant  bool // ask with the agency id in upper case
+	askMode      string // ask about this mode's tenant; "" is the stored mode
+	otherAgency  bool   // ask about another agency's tenant
+	upperTenant  bool   // ask with the agency id in upper case
 	askKind      string
 	shiftSignedD bool // ask with D one microsecond later than stored
 	unknownID    bool
@@ -131,25 +137,29 @@ func TestAdmissionRead(t *testing.T) {
 		if timeout == 0 {
 			timeout = 10000
 		}
+		mode := r.mode
+		if mode == "" {
+			mode = "live"
+		}
 		var id, deadline string
 		err := admin.QueryRow(ctx, `
 			INSERT INTO outbound_start_records
 			  (org_id, mode, kind, created_at, deadline, lease_token, access_state, cycle_marker, request_timeout_ms)
-			VALUES ($1, 'live', $2, clock_timestamp() - interval '1 hour',
+			VALUES ($1, $8, $2, clock_timestamp() - interval '1 hour',
 			        date_trunc('microseconds', clock_timestamp() + $3 * interval '1 millisecond'),
 			        $4, $5, $6::uuid, $7)
 			RETURNING id::text, to_char(deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`,
-			agency, r.kind, r.deadlineIn.Milliseconds(), lease, accessState, marker, timeout).Scan(&id, &deadline)
+			agency, r.kind, r.deadlineIn.Milliseconds(), lease, accessState, marker, timeout, mode).Scan(&id, &deadline)
 		if err != nil {
 			t.Fatalf("insert start record: %v", err)
 		}
 		made = append(made, id)
-		a := Admission{StartRecordID: id, Kind: r.kind, Deadline: deadline, Tenant: agency + ":live"}
+		a := Admission{StartRecordID: id, Kind: r.kind, Deadline: deadline, Tenant: agency + ":" + mode}
 		if r.askKind != "" {
 			a.Kind = r.askKind
 		}
-		if r.opposite {
-			a.Tenant = agency + ":test"
+		if r.askMode != "" {
+			a.Tenant = agency + ":" + r.askMode
 		}
 		if r.otherAgency {
 			a.Tenant = "6f1c2b8e-3d4a-4e5f-9a0b-1c2d3e4f5a6b:live"
@@ -204,7 +214,9 @@ func TestAdmissionRead(t *testing.T) {
 
 		{"signed kind differs from the stored kind", on, startRecord{kind: "publish", deadlineIn: future, askKind: "proxied_mutation"}, false},
 		{"job kind asked for a publish record", stopping, startRecord{kind: "publish", deadlineIn: future, askKind: "job_disable"}, false},
-		{"opposite mode of the same agency", on, startRecord{kind: "publish", deadlineIn: future, opposite: true}, false},
+		{"live record asked for the same agency's test tenant", on, startRecord{kind: "publish", deadlineIn: future, askMode: "test"}, false},
+		{"test record asked for the same agency's live tenant", on, startRecord{kind: "publish", mode: "test", deadlineIn: future, askMode: "live"}, false},
+		{"test record for its own test tenant", on, startRecord{kind: "publish", mode: "test", deadlineIn: future}, true},
 		{"another agency's tenant", on, startRecord{kind: "publish", deadlineIn: future, otherAgency: true}, false},
 		{"agency id in upper case", on, startRecord{kind: "publish", deadlineIn: future, upperTenant: true}, false},
 		{"signed D one microsecond off the stored D", on, startRecord{kind: "publish", deadlineIn: future, shiftSignedD: true}, false},
@@ -231,31 +243,201 @@ func TestAdmissionRead(t *testing.T) {
 			t.Fatalf("got %+v, %v; want admitted with 7.25s", d, err)
 		}
 	})
+
+	// The gate's database address can come to point at a standby after the gate started
+	// (a failover behind one host name). The relay stands in for that address: first in
+	// front of the primary, then of the standby. The per-call replica check must refuse.
+	t.Run("a standby behind the gate's address answers false", func(t *testing.T) {
+		gateURL, standbyURL := os.Getenv("MB_GATE_TEST_GATE_URL"), os.Getenv("MB_GATE_TEST_STANDBY_URL")
+		if standbyURL == "" {
+			t.Fatal("MB_GATE_TEST_STANDBY_URL is unset: this check needs a streaming standby of the test database")
+		}
+		r := newRelay(t, urlHost(t, gateURL))
+		pg, err := NewPG(ctx, withURLHost(t, gateURL, r.ln.Addr().String()), true)
+		if err != nil {
+			t.Fatalf("NewPG through the relay to the primary: %v", err)
+		}
+		defer pg.Close()
+		setAccess(t, on)
+		a := insert(t, startRecord{kind: "publish", deadlineIn: future})
+		if d, err := pg.Admit(ctx, a); err != nil || !d.Admit {
+			t.Fatalf("the primary answered %+v, %v; want admitted", d, err)
+		}
+
+		var lsn string
+		if err := admin.QueryRow(ctx, "SELECT pg_current_wal_lsn()::text").Scan(&lsn); err != nil {
+			t.Fatal(err)
+		}
+		standby, err := pgx.Connect(ctx, standbyURL)
+		if err != nil {
+			t.Fatalf("standby: %v", err)
+		}
+		defer standby.Close(ctx)
+		for waited := time.Duration(0); ; waited += 50 * time.Millisecond {
+			var replayed bool
+			if err := standby.QueryRow(ctx, "SELECT pg_is_in_recovery() AND pg_last_wal_replay_lsn() >= $1::pg_lsn", lsn).Scan(&replayed); err != nil {
+				t.Fatal(err)
+			}
+			if replayed {
+				break
+			}
+			if waited > 10*time.Second {
+				t.Fatal("the standby did not replay the start record within 10s")
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		r.switchTo(urlHost(t, standbyURL))
+		var d Decision
+		for i := 0; ; i++ { // the first call may meet a connection the switch closed
+			if d, err = pg.Admit(ctx, a); err == nil {
+				break
+			}
+			if i == 5 {
+				t.Fatalf("no answer through the relay from the standby: %v", err)
+			}
+		}
+		if d.Admit {
+			t.Fatal("a standby admitted a call the primary admits")
+		}
+	})
 }
 
-func TestAdmissionReadFailsClosed(t *testing.T) {
+// NewPG refuses to start the gate on a database it cannot reach, or on a connection that
+// is not a verified TLS connection to the primary as the gate role. Each case asserts the
+// reason, so a refusal by another check does not count.
+func TestNewPGRefusesAnUnsafeDatabase(t *testing.T) {
 	ctx := context.Background()
-	cases := map[string]string{
-		"empty URL":         "",
-		"nothing listening": "postgres://mbwallet_neon_webhook_gate@127.0.0.1:1/x?connect_timeout=2",
-		"no such host":      "postgres://mbwallet_neon_webhook_gate@gate-db.invalid:5432/x?connect_timeout=2",
-		"no such database":  "postgres://mbwallet_neon_webhook_gate@127.0.0.1:5432/mb_gate_no_such_db?connect_timeout=2",
+	type unsafeDB struct {
+		name, url string
+		local     bool
+		reason    string
 	}
-	for name, url := range cases {
-		t.Run(name, func(t *testing.T) {
-			pg, err := NewPG(ctx, url)
-			if url == "" && err == nil {
+	cases := []unsafeDB{
+		{"empty URL", "", true, "must be set"},
+		{"nothing listening", "postgres://mbwallet_neon_webhook_gate@127.0.0.1:1/x?sslmode=disable&connect_timeout=2", true, "did not answer"},
+		{"no such host", "postgres://mbwallet_neon_webhook_gate@gate-db.invalid:5432/x?sslmode=verify-full&connect_timeout=2", false, "did not answer"},
+		{"plaintext", "postgres://mbwallet_neon_webhook_gate@db.example.com/x?sslmode=disable", false, "sslmode=verify-full"},
+		{"no sslmode, which falls back to plaintext", "postgres://mbwallet_neon_webhook_gate@db.example.com/x", false, "sslmode=verify-full"},
+		{"sslmode=require, which skips the certificate", "postgres://mbwallet_neon_webhook_gate@db.example.com/x?sslmode=require", false, "sslmode=verify-full"},
+		{"sslmode=verify-ca, which skips the host name", "postgres://mbwallet_neon_webhook_gate@db.example.com/x?sslmode=verify-ca", false, "sslmode=verify-full"},
+		{"the local waiver for a remote host", "postgres://mbwallet_neon_webhook_gate@db.example.com/x?sslmode=disable", true, "not local"},
+		{"the local waiver for a remote second host", "postgres://mbwallet_neon_webhook_gate@127.0.0.1,db.example.com/x?sslmode=disable", true, "not local"},
+	}
+	if gateURL, adminURL, standbyURL := os.Getenv("MB_GATE_TEST_GATE_URL"), os.Getenv("MB_GATE_TEST_ADMIN_URL"), os.Getenv("MB_GATE_TEST_STANDBY_URL"); gateURL != "" && adminURL != "" && standbyURL != "" {
+		cases = append(cases,
+			unsafeDB{"the owner role in place of the gate role", adminURL, true, "want " + GateRole},
+			unsafeDB{"a standby", standbyURL, true, "is a standby"},
+		)
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pg, err := NewPG(ctx, tc.url, tc.local)
+			if err == nil {
 				pg.Close()
-				t.Fatal("NewPG accepted an empty URL, which libpq defaults would fill from the host's environment")
+				t.Fatal("NewPG started the gate on this database")
 			}
-			if err != nil {
-				return // refused at construction: the gate never starts
-			}
-			defer pg.Close()
-			d, err := pg.Admit(ctx, Admission{StartRecordID: "0b5f1e2a-7c3d-4e8f-9a1b-2c3d4e5f6a7b", Kind: "publish", Deadline: "2999-01-01T00:00:00.000000Z", Tenant: "x:live"})
-			if err == nil || d.Admit {
-				t.Fatalf("got %+v, %v: an unreachable database must be an error and no admission", d, err)
+			if !strings.Contains(err.Error(), tc.reason) {
+				t.Fatalf("refused for another reason: %v (want %q)", err, tc.reason)
 			}
 		})
 	}
+}
+
+// The configurations the gate is meant to start with do start: the local stack's
+// plaintext with the waiver, and verify-full against a server whose certificate the
+// URL's sslrootcert names (MB_GATE_TEST_GATE_TLS_URL).
+func TestNewPGStartsOnTheGateDatabase(t *testing.T) {
+	gateURL, tlsURL := os.Getenv("MB_GATE_TEST_GATE_URL"), os.Getenv("MB_GATE_TEST_GATE_TLS_URL")
+	if gateURL == "" || tlsURL == "" {
+		t.Skip("MB_GATE_TEST_GATE_URL and MB_GATE_TEST_GATE_TLS_URL are unset")
+	}
+	for name, c := range map[string]struct {
+		url   string
+		local bool
+	}{"local plaintext": {gateURL, true}, "verify-full": {tlsURL, false}} {
+		t.Run(name, func(t *testing.T) {
+			pg, err := NewPG(context.Background(), c.url, c.local)
+			if err != nil {
+				t.Fatalf("NewPG: %v", err)
+			}
+			pg.Close()
+		})
+	}
+}
+
+// relay is a TCP forwarder whose target can be switched; a switch closes the connections
+// it carries, as a failover does.
+type relay struct {
+	ln     net.Listener
+	mu     sync.Mutex
+	target string
+	conns  []net.Conn
+}
+
+func newRelay(t *testing.T, target string) *relay {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &relay{ln: ln, target: target}
+	t.Cleanup(func() { ln.Close(); r.switchTo("") })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go r.carry(c)
+		}
+	}()
+	return r
+}
+
+func (r *relay) carry(c net.Conn) {
+	r.mu.Lock()
+	target := r.target
+	r.mu.Unlock()
+	up, err := net.Dial("tcp", target)
+	if err != nil {
+		c.Close()
+		return
+	}
+	r.mu.Lock()
+	r.conns = append(r.conns, c, up)
+	r.mu.Unlock()
+	go func() { _, _ = io.Copy(up, c); up.Close() }()
+	_, _ = io.Copy(c, up)
+	c.Close()
+}
+
+func (r *relay) switchTo(target string) {
+	r.mu.Lock()
+	r.target = target
+	conns := r.conns
+	r.conns = nil
+	r.mu.Unlock()
+	for _, c := range conns {
+		c.Close()
+	}
+}
+
+func urlHost(t *testing.T, raw string) string {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.Host
+}
+
+func withURLHost(t *testing.T, raw, host string) string {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Host = host
+	return u.String()
 }
