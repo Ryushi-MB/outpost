@@ -58,7 +58,7 @@ type startRecord struct {
 	deadlineIn   time.Duration // D relative to the database clock; negative is past
 	accessState  string
 	marker       string
-	staleToken   bool // lease token one below the stop job's current token
+	staleToken   bool // the stop job's lease was taken again after the record was written
 	leaseExpired bool // the stop job's lease expired a second ago, D still ahead
 	timeoutMs    int
 	askMode      string // ask about this mode's tenant; "" is the stored mode
@@ -102,8 +102,13 @@ func TestAdmissionRead(t *testing.T) {
 		if _, err := admin.Exec(ctx, "UPDATE stop_job_lease SET expires_at = clock_timestamp() - interval '1 second'"); err != nil {
 			t.Fatal(err)
 		}
+		// An expired lease is taken again only with a higher token (the lease trigger), so the
+		// restore is a new take and the later cases sign with its token.
 		t.Cleanup(func() {
-			_, _ = admin.Exec(ctx, "UPDATE stop_job_lease SET expires_at = clock_timestamp() + interval '1 hour'")
+			if err := admin.QueryRow(ctx, `UPDATE stop_job_lease SET fencing_token = fencing_token + 1,
+				expires_at = clock_timestamp() + interval '1 hour' RETURNING fencing_token`).Scan(&token); err != nil {
+				t.Errorf("retake the lease: %v", err)
+			}
 		})
 	}
 	var made []string
@@ -146,9 +151,6 @@ func TestAdmissionRead(t *testing.T) {
 		}
 		if r.kind != "proxied_mutation" && r.kind != "redrive" {
 			lease = token
-			if r.staleToken {
-				lease = token - 1
-			}
 		}
 		timeout := r.timeoutMs
 		if timeout == 0 {
@@ -159,18 +161,33 @@ func TestAdmissionRead(t *testing.T) {
 			mode = "live"
 		}
 		var id, deadline string
+		// A start record commits only in a state that allows it (mb-wallet-neon drizzle/0351:
+		// access On, or for a job call its own state and cycle with the lease current), so it is
+		// written in that state; each case then moves access or the lease to its condition.
+		if jobKind {
+			setAccess(t, accessRow{state: r.accessState, marker: r.marker})
+		} else {
+			setAccess(t, accessRow{state: "on"})
+		}
+		// D = created_at + the stored send window (0351); created an hour back as before.
+		window := (time.Hour + r.deadlineIn).Milliseconds()
 		err := admin.QueryRow(ctx, `
+			WITH t AS (SELECT date_trunc('microseconds', clock_timestamp()) - interval '1 hour' AS created)
 			INSERT INTO outbound_start_records
-			  (org_id, mode, kind, created_at, deadline, lease_token, access_state, cycle_marker, request_timeout_ms)
-			VALUES ($1, $8, $2, clock_timestamp() - interval '1 hour',
-			        date_trunc('microseconds', clock_timestamp() + $3 * interval '1 millisecond'),
-			        $4, $5, $6::uuid, $7)
+			  (org_id, mode, kind, created_at, deadline, lease_token, access_state, cycle_marker, request_timeout_ms,
+			   transaction_timeout_ms, proxy_call_timeout_ms)
+			SELECT $1, $8, $2, t.created, t.created + $3 * interval '1 millisecond', $4, $5, $6::uuid, $7, 5000, $3 FROM t
 			RETURNING id::text, to_char(deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`,
-			agency, r.kind, r.deadlineIn.Milliseconds(), lease, accessState, marker, timeout, mode).Scan(&id, &deadline)
+			agency, r.kind, window, lease, accessState, marker, timeout, mode).Scan(&id, &deadline)
 		if err != nil {
 			t.Fatalf("insert start record: %v", err)
 		}
 		made = append(made, id)
+		if r.staleToken {
+			if err := admin.QueryRow(ctx, "UPDATE stop_job_lease SET fencing_token = fencing_token + 1 RETURNING fencing_token").Scan(&token); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if r.ended {
 			if _, err := admin.Exec(ctx, "UPDATE outbound_start_records SET ended_at = clock_timestamp(), outcome = 'applied' WHERE id = $1::uuid", id); err != nil {
 				t.Fatalf("end start record: %v", err)
@@ -254,8 +271,8 @@ func TestAdmissionRead(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			setAccess(t, tc.access)
 			a := insert(t, tc.record)
+			setAccess(t, tc.access)
 			if tc.record.leaseExpired {
 				expireLease(t)
 			}
