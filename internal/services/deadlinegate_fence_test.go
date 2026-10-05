@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,7 +23,6 @@ import (
 	"github.com/hookdeck/outpost/internal/util/testinfra"
 	"github.com/hookdeck/outpost/internal/util/testutil"
 	"github.com/jackc/pgx/v5/pgxpool"
-	goredis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,7 +34,7 @@ type gatedAPI struct {
 	addr    string
 	tenant  string
 	records map[string]gatedRecord
-	redis   *goredis.Client
+	link    *stallingLink
 }
 
 type gatedRecord struct{ id, deadline string }
@@ -97,7 +100,8 @@ func startGatedAPI(t *testing.T, requestTimeout time.Duration) *gatedAPI {
 	c.AESEncryptionSecret = "encryptionsecret"
 	c.Topics = testutil.TestTopics
 	c.Telemetry.Disabled = true
-	c.Redis.Host, c.Redis.Port = redisConfig.Host, redisConfig.Port
+	api.link = newStallingLink(t, fmt.Sprintf("%s:%d", redisConfig.Host, redisConfig.Port))
+	c.Redis.Host, c.Redis.Port = "127.0.0.1", api.link.port
 	c.MQs.RabbitMQ.ServerURL = testinfra.EnsureRabbitMQ()
 	c.PostgresURL = testinfra.NewPostgresConfig(t)
 	c.DeadlineGate.Secret = fenceSecret
@@ -125,9 +129,6 @@ func startGatedAPI(t *testing.T, requestTimeout time.Duration) *gatedAPI {
 		res.Body.Close()
 		return res.StatusCode == http.StatusOK
 	}, 30*time.Second, 100*time.Millisecond)
-
-	api.redis = goredis.NewClient(&goredis.Options{Addr: fmt.Sprintf("%s:%d", redisConfig.Host, redisConfig.Port)})
-	t.Cleanup(func() { api.redis.Close() })
 	return api
 }
 
@@ -171,15 +172,82 @@ func do(t *testing.T, req *http.Request) (int, map[string]any) {
 	return res.StatusCode, out
 }
 
-// A gated call cut off at its request timeout must have no effect, even when the store it
-// writes to stalls and then recovers (Ospec add-agency-api-access, "Deadline gate": no
-// effect after the cut-off). Redis is paused for writes, a signed enable of a disabled
-// destination is cut off with 503, Redis resumes, and the destination must still be
-// disabled, so a publish afterwards matches no destination and nothing is delivered.
+// stallingLink is the network between the service and Redis. Once stalled, it holds the
+// first write a connection sends (a MULTI, EVAL or HSET) and everything after it until
+// released, then delivers it to Redis even if the service has hung up meanwhile, as a
+// stalled network does. Reads, TIME included, pass until a write is held.
+type stallingLink struct {
+	port     int
+	upstream string
+	stalled  atomic.Bool
+	released chan struct{}
+	once     sync.Once
+}
+
+func newStallingLink(t *testing.T, upstream string) *stallingLink {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	l := &stallingLink{port: ln.Addr().(*net.TCPAddr).Port, upstream: upstream, released: make(chan struct{})}
+	t.Cleanup(func() { ln.Close(); l.release() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go l.serve(c)
+		}
+	}()
+	return l
+}
+
+func (l *stallingLink) stall()   { l.stalled.Store(true) }
+func (l *stallingLink) release() { l.once.Do(func() { close(l.released) }) }
+
+var redisWrites = [][]byte{[]byte("\r\nmulti\r\n"), []byte("\r\neval\r\n"), []byte("\r\nhset\r\n")}
+
+func (l *stallingLink) serve(c net.Conn) {
+	u, err := net.Dial("tcp", l.upstream)
+	if err != nil {
+		c.Close()
+		return
+	}
+	go func() { _, _ = io.Copy(c, u); c.Close() }()
+	held := false
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := c.Read(buf)
+		if n > 0 {
+			chunk := bytes.ToLower(buf[:n])
+			if !held && l.stalled.Load() && slices.ContainsFunc(redisWrites, func(w []byte) bool { return bytes.Contains(chunk, w) }) {
+				held = true
+			}
+			if held {
+				<-l.released
+			}
+			if _, werr := u.Write(buf[:n]); werr != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	// The service may have hung up; Redis still runs what reached it.
+	time.Sleep(time.Second)
+	u.Close()
+}
+
+// A gated call cut off at its request timeout must have no effect, even when its write
+// reaches Redis after the cut-off (Ospec add-agency-api-access, "Deadline gate": no
+// effect after the cut-off). The network to Redis stalls on a signed enable of a disabled
+// destination; the call is cut off with 503; the held write then reaches Redis. The
+// destination must still be disabled, so a publish afterwards matches no destination and
+// nothing is delivered.
 func TestAGatedWriteCannotLandAfterTheCutOff(t *testing.T) {
 	const timeout = 400 * time.Millisecond
 	api := startGatedAPI(t, timeout)
-	ctx := context.Background()
 	base := "/api/v1/tenants/" + api.tenant
 
 	status, body := api.signed(t, "proxied_mutation", http.MethodPut, base, map[string]any{})
@@ -194,17 +262,15 @@ func TestAGatedWriteCannotLandAfterTheCutOff(t *testing.T) {
 	status, body = api.signed(t, "proxied_mutation", http.MethodPut, base+"/destinations/"+dest+"/disable", nil)
 	require.Equal(t, http.StatusOK, status, body["_raw"])
 
-	const pause = 1500 * time.Millisecond
-	require.NoError(t, api.redis.Do(ctx, "CLIENT", "PAUSE", pause.Milliseconds(), "WRITE").Err())
-	paused := time.Now()
+	api.link.stall()
 	status, body = api.signed(t, "proxied_mutation", http.MethodPut, base+"/destinations/"+dest+"/enable", nil)
-	took := time.Since(paused)
 	require.Equal(t, http.StatusServiceUnavailable, status, body["_raw"])
 	require.Contains(t, body["_raw"], "cut off at its request timeout")
-	require.Less(t, took, pause, "the gate must answer at its cut-off, while Redis is still paused")
 
-	// Redis resumes; give any write still queued behind the pause time to land.
-	time.Sleep(time.Until(paused.Add(pause + time.Second)))
+	// The held write reaches Redis after the cut-off.
+	time.Sleep(300 * time.Millisecond)
+	api.link.release()
+	time.Sleep(1500 * time.Millisecond)
 	status, body = api.get(t, base+"/destinations/"+dest)
 	require.Equal(t, http.StatusOK, status, body["_raw"])
 	require.NotNil(t, body["disabled_at"], "the enable landed after the gate cut it off: %s", body["_raw"])

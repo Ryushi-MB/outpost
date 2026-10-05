@@ -105,7 +105,7 @@ write fence failure ignored|internal/deadlinegate/gate.go|./internal/deadlinegat
 no write fence accepted|internal/deadlinegate/gate.go|./internal/deadlinegate|s/if fencer == nil \{/if false {/
 Redis clock not checked before the write|internal/redis/fence.go|./internal/redis|s/if now >= tonumber\(ARGV\[1\]\) then/if false then/
 fence not tied to the cut-off|internal/redis/fence.go|./internal/redis|s/now\.UnixMicro\(\)\+left\.Microseconds\(\)/now.UnixMicro()+left.Microseconds()+3600000000/
-unknown write passes under a fence|internal/redis/fence.go|./internal/redis|s/if !known \{/if false {/
+unknown write passes under a fence|internal/redis/fence.go|./internal/redis|s/if !known \{/if !known \&\& false {/
 fence hook not installed|internal/redis/redis.go|./internal/redis|s/hooked\.AddHook\(fenceHook\{\}\)/_ = hooked/
 Redis ignores the call's deadline (ContextTimeoutEnabled)|internal/redis/redis.go|./internal/redis|s/\/\/ See createClusterClient\.\n\t\tContextTimeoutEnabled: true,\n//
 destination type not checked at the gate|internal/deadlinegate/gate.go|./internal/deadlinegate|s/if !destinationTypeAllowed\(r, body\) \{/if false {/
