@@ -38,6 +38,8 @@ const fenceSecret = "deadline-gate-fence-secret-0123456789abcdef"
 type gatedAPI struct {
 	addr    string
 	tenant  string
+	agency  string
+	admin   *pgxpool.Pool
 	records map[string]gatedRecord
 	link    *stallingLink // to Redis: holds the first write once stalled
 	rabbit  *stallingLink // to RabbitMQ: holds everything once stalled
@@ -73,7 +75,7 @@ func startGatedAPI(t *testing.T, requestTimeout time.Duration, delivery bool) *g
 	var token int64
 	require.NoError(t, admin.QueryRow(ctx, "SELECT fencing_token FROM stop_job_lease").Scan(&token))
 
-	api := &gatedAPI{tenant: agency + ":live", records: map[string]gatedRecord{}}
+	api := &gatedAPI{tenant: agency + ":live", agency: agency, admin: admin, records: map[string]gatedRecord{}}
 	var made []string
 	t.Cleanup(func() {
 		_, _ = admin.Exec(context.Background(), "DELETE FROM outbound_start_records WHERE id = ANY($1::uuid[])", made)
@@ -163,13 +165,18 @@ func startGatedAPI(t *testing.T, requestTimeout time.Duration, delivery bool) *g
 // signed sends a call signed for the start record of kind, as MB Wallet's Worker does.
 func (a *gatedAPI) signed(t *testing.T, kind, method, target string, body any) (int, map[string]any) {
 	t.Helper()
+	return a.signedWith(t, a.records[kind], kind, method, target, body)
+}
+
+// signedWith sends a call signed for rec.
+func (a *gatedAPI) signedWith(t *testing.T, rec gatedRecord, kind, method, target string, body any) (int, map[string]any) {
+	t.Helper()
 	var raw []byte
 	if body != nil {
 		var err error
 		raw, err = json.Marshal(body)
 		require.NoError(t, err)
 	}
-	rec := a.records[kind]
 	req, err := http.NewRequest(method, a.addr+target, bytes.NewReader(raw))
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer apikey")
