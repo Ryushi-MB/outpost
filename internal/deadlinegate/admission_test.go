@@ -67,6 +67,7 @@ type startRecord struct {
 	askKind      string
 	shiftSignedD bool // ask with D one microsecond later than stored
 	unknownID    bool
+	ended        bool // MB Wallet committed the call's end record (ended_at, outcome)
 }
 
 func TestAdmissionRead(t *testing.T) {
@@ -170,6 +171,11 @@ func TestAdmissionRead(t *testing.T) {
 			t.Fatalf("insert start record: %v", err)
 		}
 		made = append(made, id)
+		if r.ended {
+			if _, err := admin.Exec(ctx, "UPDATE outbound_start_records SET ended_at = clock_timestamp(), outcome = 'applied' WHERE id = $1::uuid", id); err != nil {
+				t.Fatalf("end start record: %v", err)
+			}
+		}
 		a := Admission{StartRecordID: id, Kind: r.kind, Deadline: deadline, Tenant: agency + ":" + mode}
 		if r.askKind != "" {
 			a.Kind = r.askKind
@@ -241,6 +247,10 @@ func TestAdmissionRead(t *testing.T) {
 		{"agency id in upper case", on, startRecord{kind: "publish", deadlineIn: future, upperTenant: true}, false},
 		{"signed D one microsecond off the stored D", on, startRecord{kind: "publish", deadlineIn: future, shiftSignedD: true}, false},
 		{"no such start record", on, startRecord{kind: "publish", deadlineIn: future, unknownID: true}, false},
+
+		{"proxied mutation after its end record, before D", on, startRecord{kind: "proxied_mutation", deadlineIn: future, ended: true}, false},
+		{"publish after its end record, before D", on, startRecord{kind: "publish", deadlineIn: future, ended: true}, false},
+		{"disable after its end record, in its Stopping cycle before D", stopping, startRecord{kind: "job_disable", deadlineIn: future, accessState: "stopping", marker: markerA, ended: true}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
