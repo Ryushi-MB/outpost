@@ -22,6 +22,7 @@ import (
 	"github.com/hookdeck/outpost/internal/deadlinegate"
 	"github.com/hookdeck/outpost/internal/infra"
 	"github.com/hookdeck/outpost/internal/logging"
+	"github.com/hookdeck/outpost/internal/migrator"
 	"github.com/hookdeck/outpost/internal/redis"
 	"github.com/hookdeck/outpost/internal/services"
 	"github.com/hookdeck/outpost/internal/telemetry"
@@ -130,6 +131,13 @@ func startGatedAPI(t *testing.T, requestTimeout time.Duration, delivery bool) *g
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	c.MQs.RabbitMQ.Exchange, c.MQs.RabbitMQ.DeliveryQueue, c.MQs.RabbitMQ.LogQueue = "gate-"+suffix, "gate-delivery-"+suffix, "gate-log-"+suffix
 	require.NoError(t, c.Validate(config.Flags{}))
+	// Outpost's own log store schema, as "outpost migrate apply" gives a deployment: the
+	// retry path reads earlier attempts from it.
+	m, err := migrator.New(c.ToMigratorOpts())
+	require.NoError(t, err)
+	_, _, err = m.Up(context.Background(), -1)
+	require.NoError(t, err)
+	_, _ = m.Close(context.Background())
 	infraRedis, err := redis.New(context.Background(), c.Redis.ToConfig())
 	require.NoError(t, err)
 	t.Cleanup(func() { infraRedis.Close() })
