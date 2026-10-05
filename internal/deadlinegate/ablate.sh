@@ -10,35 +10,42 @@
 # The database checks skip without them, and the wiring rows (./internal/services) need
 # Docker, as do the write-fence rows (./internal/redis, ./internal/services: Redis Stack),
 # so the script refuses rather than count a skip as red.
+# ABLATE_ROWS=<extended regex> runs only the rows whose name matches it; each package is
+# checked green, unmutated, before its first row runs.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 for v in MB_GATE_TEST_ADMIN_URL MB_GATE_TEST_GATE_URL MB_GATE_TEST_STANDBY_URL MB_GATE_TEST_GATE_TLS_URL; do
   [ -n "$(printenv "$v")" ] || { echo "ablate: set $v" >&2; exit 2; }
 done
-files=(internal/deadlinegate/gate.go internal/deadlinegate/admission.go internal/config/validation.go internal/services/builder.go internal/redis/fence.go internal/redis/redis.go internal/destregistry/providers/default.go internal/destregistry/httpclient.go internal/destregistry/providers/destwebhook/httphelper.go internal/publishmq/eventhandler.go internal/deliverymq/messagehandler.go)
+files=(internal/deadlinegate/gate.go internal/deadlinegate/admission.go internal/config/validation.go internal/services/builder.go internal/redis/fence.go internal/redis/redis.go internal/destregistry/providers/default.go internal/destregistry/httpclient.go internal/destregistry/providers/destwebhook/httphelper.go internal/publishmq/eventhandler.go internal/deliverymq/messagehandler.go internal/config/mbwallet.go)
 backup="$(mktemp -d)"
 for f in "${files[@]}"; do mkdir -p "$backup/$(dirname "$f")"; cp "$f" "$backup/$f"; done
 restore() { for f in "${files[@]}"; do cp "$backup/$f" "$f"; done; }
 trap restore EXIT
 
-pkgs=(./internal/deadlinegate ./internal/config ./internal/services ./internal/redis ./internal/destregistry/providers ./internal/destregistry/providers/destwebhook)
 # The packages that start containers run only the tests that own this script's rows, so a
 # row does not rerun upstream's container suites (a loaded Docker Desktop makes those slow
 # and flaky). Every other package runs whole.
 declare -A only=(
-  [./internal/services]='^(TestAPIServiceRunsBehindTheDeadlineGate|TestAGatedWriteCannotLandAfterTheCutOff|TestOnlyWebhookDestinationsCanBeCreated|TestALateEnqueueIsNeverDelivered)$'
+  [./internal/services]='^(TestEveryServiceRefusesToStartOutsideMBWalletSettings|TestAPIServiceRunsBehindTheDeadlineGate|TestAGatedWriteCannotLandAfterTheCutOff|TestOnlyWebhookDestinationsCanBeCreated|TestALateEnqueueIsNeverDelivered)$'
   [./internal/redis]='^TestWriteFence$'
+  [./internal/deliverymq]='^TestMessageHandler_GatedTaskFollowsItsAcceptance$'
 )
 gotest() { go test -count=1 ${only[$1]:+-run "${only[$1]}"} "$1"; }
-for p in "${pkgs[@]}"; do
-  gotest "$p" >/dev/null || { echo "ablate: $p is not green before ablation" >&2; exit 1; }
-done
+declare -A green=()
+ensure_green() {
+  [ -n "${green[$1]:-}" ] && return 0
+  gotest "$1" >/dev/null || { echo "ablate: $1 is not green before ablation" >&2; exit 1; }
+  green[$1]=1
+}
 
 failed=0
 # name | file | package that must go red | perl substitution that removes exactly one check
 while IFS='|' read -r name file pkg expr; do
   [ -n "$name" ] || continue
+  [ -z "${ABLATE_ROWS:-}" ] || [[ "$name" =~ $ABLATE_ROWS ]] || continue
   restore
+  ensure_green "$pkg"
   perl -0pi -e "$expr" "$file"
   if cmp -s "$file" "$backup/$file"; then
     echo "NOT APPLIED  $name"; failed=1; continue
@@ -114,10 +121,25 @@ a non-webhook provider registered|internal/destregistry/providers/default.go|./i
 redirects followed|internal/destregistry/httpclient.go|./internal/destregistry/providers/destwebhook|s/CheckRedirect: func\(\*http\.Request, \[\]\*http\.Request\) error \{ return http\.ErrUseLastResponse \},//
 a 3xx counted as delivered|internal/destregistry/providers/destwebhook/httphelper.go|./internal/destregistry/providers/destwebhook|s/if resp\.StatusCode < 200 \|\| resp\.StatusCode >= 300 \{/if resp.StatusCode >= 400 {/
 late enqueue: tasks not stamped with their acceptance|internal/publishmq/eventhandler.go|./internal/services|s/task\.Acceptance = acceptance/_ = acceptance/
-late enqueue: acceptance record never written|internal/redis/fence.go|./internal/services|s/return a\.Client\.Set\(ctx, p\.Key, "1", acceptanceTTL\)\.Err\(\)/return nil/
-late enqueue: consumer delivers an unaccepted task|internal/deliverymq/messagehandler.go|./internal/services|s/if !accepted \{/if !accepted \&\& false {/
-late enqueue: publish acceptor not wired|internal/services/builder.go|./internal/services|s/\t\tpublishmq\.WithAcceptor\(redis\.Acceptances\{Client: svc\.redisClient\}\),\n//
-late enqueue: consumer acceptance check not wired|internal/services/builder.go|./internal/services|s/\t\tdeliverymq\.WithAcceptance\(redis\.Acceptances\{Client: svc\.redisClient\}\),\n//
-late enqueue: a missing record is never final|internal/redis/fence.go|./internal/redis|s/if now >= acc\.Fence \{/if now >= acc.Fence \&\& false {/
+late enqueue: acceptance record never written|internal/redis/fence.go|./internal/services|s/return a\.Client\.SetArgs\(ctx, p\.Key, "1", r\.SetArgs\{ExpireAt: expiresAt\}\)\.Err\(\)/_ = expiresAt\n\treturn nil/
+late enqueue: consumer delivers an unaccepted task|internal/deliverymq/messagehandler.go|./internal/services|s/\t\tcase models\.Accepted:\n/\t\tcase models.Accepted, models.NeverAccepted:\n/
+late enqueue: publish acceptor not wired|internal/services/builder.go|./internal/services|s/\t\tpublishmq\.WithAcceptor\(b\.acceptances\(svc\.redisClient\)\),\n//
+late enqueue: consumer acceptance check not wired|internal/services/builder.go|./internal/services|s/\t\tdeliverymq\.WithAcceptance\(b\.acceptances\(svc\.redisClient\)\),\n//
+late enqueue: a missing record is never final|internal/redis/fence.go|./internal/redis|s/case now >= acc\.Fence:/case false:/
+acceptance retention ignored (expiry at the fence)|internal/redis/fence.go|./internal/redis|s/Expires: f\.until \+ a\.Retention\.Microseconds\(\)/Expires: f.until/
+an expired acceptance read as never accepted|internal/redis/fence.go|./internal/redis|s/case now >= acc\.Expires:\n\t\t\treturn models\.RetentionPassed, nil\n\t\tcase now >= acc\.Fence:\n\t\t\treturn models\.NeverAccepted, nil/case now >= acc.Fence:\n\t\t\treturn models.NeverAccepted, nil\n\t\tcase now >= acc.Expires:\n\t\t\treturn models.RetentionPassed, nil/
+acceptance record expires before its retention|internal/redis/fence.go|./internal/redis|s/\(p\.Expires\+999_999\)\/1_000_000/p.Expires\/1_000_000 - 1/
+a task past its acceptance retention is dropped|internal/deliverymq/messagehandler.go|./internal/deliverymq|s/case models\.RetentionPassed:/case -1:/
+a gated task delivered without an acceptance reader|internal/deliverymq/messagehandler.go|./internal/deliverymq|s/verdict := models\.NeverAccepted/verdict := models.Accepted/
+start: delivery timeout not checked|internal/config/mbwallet.go|./internal/config|s/if c\.DeliveryTimeoutSeconds != MBWalletDeliveryTimeoutSeconds \{/if false {/
+start: retry schedule not checked|internal/config/mbwallet.go|./internal/config|s/if !slices\.Equal\(c\.RetrySchedule, MBWalletRetrySchedule\) \{/if false \&\& !slices.Equal(c.RetrySchedule, MBWalletRetrySchedule) {/
+start: auto-disable not checked|internal/config/mbwallet.go|./internal/config|s/if c\.Alert\.AutoDisableDestination \{/if false {/
+start: egress proxy not required|internal/config/mbwallet.go|./internal/config|s/strings\.TrimSpace\(c\.Destinations\.Webhook\.ProxyURL\) == "" \{/false {/
+start: pprof not refused|internal/config/mbwallet.go|./internal/config|s/if c\.PprofEnabled \{/if false {/
+start: operator event sinks not refused|internal/config/mbwallet.go|./internal/config|s/if strings\.TrimSpace\(value\) != "" \{/if false \&\& strings.TrimSpace(value) != "" {/
+start: telemetry not refused|internal/config/mbwallet.go|./internal/config|s/if !c\.DisableTelemetry \&\& !c\.Telemetry\.Disabled \{/if false {/
+start: OpenTelemetry export not refused|internal/config/mbwallet.go|./internal/config|s/if c\.OpenTelemetry\.ServiceName != "" \{/if false {/
+start: acceptance retention minimum not checked|internal/config/mbwallet.go|./internal/config|s/retention < MBWalletMinAcceptanceRetention \{/false {\n\t\t_ = retention/
+start: checks not run by the services|internal/services/builder.go|./internal/services|s/if err := b\.cfg\.ValidateMBWallet\(\); err != nil \{/if err := b.cfg.ValidateMBWallet(); false \&\& err != nil {/
 MUTATIONS
 exit "$failed"
