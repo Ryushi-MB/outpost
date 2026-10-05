@@ -140,6 +140,17 @@ func ClassifyProxyConnectResponse(status int, header http.Header, underlying err
 		http.StatusForbidden:
 		// Envoy RBAC denies (the egress SSRF gate) are a property of the
 		// target, not of our credentials: a failed attempt, not a nack.
+		// MB Wallet: Stripe's Smokescreen denies a CONNECT to a refused address with 407 and
+		// X-Smokescreen-Error "Egress proxying is denied to host ...". That is the destination's
+		// failure too (its name resolved into a refused range): a failed attempt, not a nack.
+		if status == http.StatusProxyAuthRequired && strings.HasPrefix(header.Get("X-Smokescreen-Error"), "Egress proxying is denied to host ") {
+			return &ErrProxyDestination{
+				Underlying:  underlying,
+				Code:        "network_unreachable",
+				DestHost:    destHost,
+				Diagnostics: map[string]string{"smokescreen_error": header.Get("X-Smokescreen-Error")},
+			}
+		}
 		if status == http.StatusForbidden && strings.Contains(details, "rbac_access_denied") {
 			return &ErrProxyDestination{
 				Underlying:  underlying,
