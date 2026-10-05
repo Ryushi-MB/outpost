@@ -22,7 +22,17 @@ restore() { for f in "${files[@]}"; do cp "$backup/$f" "$f"; done; }
 trap restore EXIT
 
 pkgs=(./internal/deadlinegate ./internal/config ./internal/services ./internal/redis ./internal/destregistry/providers ./internal/destregistry/providers/destwebhook)
-go test -count=1 "${pkgs[@]}" >/dev/null || { echo "ablate: the tests are not green before ablation" >&2; exit 1; }
+# The packages that start containers run only the tests that own this script's rows, so a
+# row does not rerun upstream's container suites (a loaded Docker Desktop makes those slow
+# and flaky). Every other package runs whole.
+declare -A only=(
+  [./internal/services]='^(TestAPIServiceRunsBehindTheDeadlineGate|TestAGatedWriteCannotLandAfterTheCutOff|TestOnlyWebhookDestinationsCanBeCreated)$'
+  [./internal/redis]='^TestWriteFence$'
+)
+gotest() { go test -count=1 ${only[$1]:+-run "${only[$1]}"} "$1"; }
+for p in "${pkgs[@]}"; do
+  gotest "$p" >/dev/null || { echo "ablate: $p is not green before ablation" >&2; exit 1; }
+done
 
 failed=0
 # name | file | package that must go red | perl substitution that removes exactly one check
@@ -37,7 +47,7 @@ while IFS='|' read -r name file pkg expr; do
   if ! go vet "$pkg" >/dev/null 2>&1; then
     echo "NO BUILD     $name"; failed=1; continue
   fi
-  if go test -count=1 "$pkg" >/dev/null 2>&1; then
+  if gotest "$pkg" >/dev/null 2>&1; then
     echo "STAYED GREEN $name"; failed=1
   else
     echo "red          $name"
