@@ -94,6 +94,7 @@ gate role not checked on connect|internal/deadlinegate/admission.go|./internal/d
 standby accepted at start|internal/deadlinegate/admission.go|./internal/deadlinegate|s/if standby \{/if false {/
 replica check removed (pg_is_in_recovery)|internal/deadlinegate/admission.go|./internal/deadlinegate|s/NOT pg_is_in_recovery\(\)\s+AND //
 D not checked|internal/deadlinegate/admission.go|./internal/deadlinegate|s/\n\s+AND clock_timestamp\(\) < s.deadline//
+an ended call admitted|internal/deadlinegate/admission.go|./internal/deadlinegate|s/\n\s+AND s.ended_at IS NULL//
 signed D not compared with stored D|internal/deadlinegate/admission.go|./internal/deadlinegate|s/\n\s+AND s.deadline = \$3::timestamptz//
 kind not compared|internal/deadlinegate/admission.go|./internal/deadlinegate|s/\n\s+AND s.kind = \$2//
 tenant not compared|internal/deadlinegate/admission.go|./internal/deadlinegate|s/\n\s+AND s.org_id::text \|\| ':' \|\| s.mode = \$4//

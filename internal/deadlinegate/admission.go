@@ -13,21 +13,23 @@ import (
 )
 
 // admitSQL is the gate's one statement (task 9.14). It reads only the columns
-// mbwallet_neon_webhook_gate holds SELECT on (mb-wallet-neon drizzle/0341) and answers
-// true only when the start record exists, its stored kind equals the signed kind, its
-// stored D equals the signed D, its tenant "<agency>:<mode>" equals the one the call
-// acts on, the database clock is before D, and the kind's own condition holds: access On
-// for a publish, redrive, republish or proxied mutation; for a job call the access state
-// and cycle marker it was written under, the stop job lease's current fencing token, and
-// that lease not yet expired by the database clock (a runner whose lease lapsed before D
-// is no longer the stop job). The lease columns need SELECT (fencing_token, expires_at)
-// for the gate role. A replica answers false. Any other outcome refuses the call.
+// mbwallet_neon_webhook_gate holds SELECT on (mb-wallet-neon drizzle/0341, 0351 and 0354) and
+// answers true only when the start record exists, its stored kind equals the signed kind, its
+// stored D equals the signed D, its tenant "<agency>:<mode>" equals the one the call acts on,
+// the call has not ended (ended_at is NULL: once MB Wallet commits a call's end record, its
+// start record admits nothing more), the database clock is before D, and the kind's own
+// condition holds: access On for a publish, redrive, republish or proxied mutation; for a job
+// call the access state and cycle marker it was written under, the stop job lease's current
+// fencing token, and that lease not yet expired by the database clock (a runner whose lease
+// lapsed before D is no longer the stop job). The lease columns need SELECT (fencing_token,
+// expires_at) for the gate role. A replica answers false. Any other outcome refuses the call.
 const admitSQL = `
 SELECT COALESCE(
          NOT pg_is_in_recovery()
          AND s.kind = $2
          AND s.deadline = $3::timestamptz
          AND s.org_id::text || ':' || s.mode = $4
+         AND s.ended_at IS NULL
          AND clock_timestamp() < s.deadline
          AND CASE
                WHEN s.kind IN ('publish', 'redrive', 'republish', 'proxied_mutation')
