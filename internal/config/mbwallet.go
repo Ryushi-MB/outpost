@@ -48,6 +48,12 @@ func (c *Config) ValidateMBWallet() error {
 	if strings.TrimSpace(c.Destinations.ProxyURL) == "" && strings.TrimSpace(c.Destinations.Webhook.ProxyURL) == "" {
 		return refuse("DESTINATIONS_PROXY_URL", "is unset: every delivery must leave through the egress proxy")
 	}
+	// MB Wallet publishes the event's body id as the metadata key Mb-Event-Id, and every
+	// delivery must carry it under that exact header name. A metadata header is the prefix
+	// plus the key; whitespace is how Outpost takes an empty prefix (unset means x-outpost-).
+	if p := c.Destinations.Webhook.HeaderPrefix; p == "" || strings.TrimSpace(p) != "" {
+		return refuse("DESTINATIONS_WEBHOOK_HEADER_PREFIX", "is %q, must be whitespace (no prefix), so metadata Mb-Event-Id is sent as the header Mb-Event-Id", p)
+	}
 	if c.PprofEnabled {
 		return refuse("PPROF_ENABLED", "is true: profiling endpoints are served outside the deadline gate")
 	}

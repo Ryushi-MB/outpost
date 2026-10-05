@@ -136,6 +136,7 @@ start: delivery timeout not checked|internal/config/mbwallet.go|./internal/confi
 start: retry schedule not checked|internal/config/mbwallet.go|./internal/config|s/if !slices\.Equal\(c\.RetrySchedule, MBWalletRetrySchedule\) \{/if false \&\& !slices.Equal(c.RetrySchedule, MBWalletRetrySchedule) {/
 start: auto-disable not checked|internal/config/mbwallet.go|./internal/config|s/if c\.Alert\.AutoDisableDestination \{/if false {/
 start: egress proxy not required|internal/config/mbwallet.go|./internal/config|s/strings\.TrimSpace\(c\.Destinations\.Webhook\.ProxyURL\) == "" \{/false {/
+start: header prefix not checked|internal/config/mbwallet.go|./internal/config|s/p == "" \|\| strings\.TrimSpace\(p\) != ""/false/
 start: pprof not refused|internal/config/mbwallet.go|./internal/config|s/if c\.PprofEnabled \{/if false {/
 start: operator event sinks not refused|internal/config/mbwallet.go|./internal/config|s/if strings\.TrimSpace\(value\) != "" \{/if false \&\& strings.TrimSpace(value) != "" {/
 start: telemetry not refused|internal/config/mbwallet.go|./internal/config|s/if !c\.DisableTelemetry \&\& !c\.Telemetry\.Disabled \{/if false {/
