@@ -18,8 +18,10 @@ import (
 // stored D equals the signed D, its tenant "<agency>:<mode>" equals the one the call
 // acts on, the database clock is before D, and the kind's own condition holds: access On
 // for a publish, redrive, republish or proxied mutation; for a job call the access state
-// and cycle marker it was written under, and the stop job lease's current fencing token.
-// A replica answers false. Any other outcome refuses the call.
+// and cycle marker it was written under, the stop job lease's current fencing token, and
+// that lease not yet expired by the database clock (a runner whose lease lapsed before D
+// is no longer the stop job). The lease columns need SELECT (fencing_token, expires_at)
+// for the gate role. A replica answers false. Any other outcome refuses the call.
 const admitSQL = `
 SELECT COALESCE(
          NOT pg_is_in_recovery()
@@ -34,6 +36,7 @@ SELECT COALESCE(
                  THEN a.state = s.access_state
                   AND a.cycle_marker = s.cycle_marker
                   AND s.lease_token = l.fencing_token
+                  AND clock_timestamp() < l.expires_at
                ELSE false
              END,
          false),

@@ -59,6 +59,7 @@ type startRecord struct {
 	accessState  string
 	marker       string
 	staleToken   bool // lease token one below the stop job's current token
+	leaseExpired bool // the stop job's lease expired a second ago, D still ahead
 	timeoutMs    int
 	askMode      string // ask about this mode's tenant; "" is the stored mode
 	otherAgency  bool   // ask about another agency's tenant
@@ -85,9 +86,24 @@ func TestAdmissionRead(t *testing.T) {
 	if err != nil && err != pgx.ErrNoRows {
 		t.Fatal(err)
 	}
+	// The stop job holds the lease for the next hour, as it does while it runs; a new take
+	// raises the token.
 	var token int64
-	if err := admin.QueryRow(ctx, "UPDATE stop_job_lease SET fencing_token = fencing_token + 3 RETURNING fencing_token").Scan(&token); err != nil {
+	if err := admin.QueryRow(ctx, `UPDATE stop_job_lease SET fencing_token = fencing_token + 3, holder = 'admission-test',
+		expires_at = clock_timestamp() + interval '1 hour' RETURNING fencing_token`).Scan(&token); err != nil {
 		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec(ctx, "UPDATE stop_job_lease SET fencing_token = fencing_token + 1, holder = NULL, expires_at = NULL")
+	})
+	expireLease := func(t *testing.T) {
+		t.Helper()
+		if _, err := admin.Exec(ctx, "UPDATE stop_job_lease SET expires_at = clock_timestamp() - interval '1 second'"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = admin.Exec(ctx, "UPDATE stop_job_lease SET expires_at = clock_timestamp() + interval '1 hour'")
+		})
 	}
 	var made []string
 	t.Cleanup(func() {
@@ -211,6 +227,10 @@ func TestAdmissionRead(t *testing.T) {
 		{"enable once Stopping began", accessRow{state: "stopping", marker: markerA}, startRecord{kind: "job_enable", deadlineIn: future, accessState: "enabling", marker: markerA}, false},
 		{"list in Enabling after the cycle moved to Stopping", stopping, startRecord{kind: "job_list", deadlineIn: future, accessState: "enabling", marker: markerA}, false},
 		{"publish stale lease is not the gate's check", on, startRecord{kind: "publish", deadlineIn: future, staleToken: true}, true},
+		{"disable by the lease holder after its lease expired, before D", stopping, startRecord{kind: "job_disable", deadlineIn: future, accessState: "stopping", marker: markerA, leaseExpired: true}, false},
+		{"list by the lease holder after its lease expired, before D", stopping, startRecord{kind: "job_list", deadlineIn: future, accessState: "stopping", marker: markerA, leaseExpired: true}, false},
+		{"enable by the lease holder after its lease expired, before D", enabling, startRecord{kind: "job_enable", deadlineIn: future, accessState: "enabling", marker: markerA, leaseExpired: true}, false},
+		{"publish expired lease is not the gate's check", on, startRecord{kind: "publish", deadlineIn: future, leaseExpired: true}, true},
 
 		{"signed kind differs from the stored kind", on, startRecord{kind: "publish", deadlineIn: future, askKind: "proxied_mutation"}, false},
 		{"job kind asked for a publish record", stopping, startRecord{kind: "publish", deadlineIn: future, askKind: "job_disable"}, false},
@@ -226,6 +246,9 @@ func TestAdmissionRead(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			setAccess(t, tc.access)
 			a := insert(t, tc.record)
+			if tc.record.leaseExpired {
+				expireLease(t)
+			}
 			d, err := gate.Admit(ctx, a)
 			if err != nil {
 				t.Fatalf("Admit: %v", err)

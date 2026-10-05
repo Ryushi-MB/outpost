@@ -102,6 +102,7 @@ access On not required|internal/deadlinegate/admission.go|./internal/deadlinegat
 job state not compared|internal/deadlinegate/admission.go|./internal/deadlinegate|s/THEN a.state = s.access_state/THEN true/
 cycle marker not compared|internal/deadlinegate/admission.go|./internal/deadlinegate|s/\n\s+AND a.cycle_marker = s.cycle_marker//
 lease token not compared|internal/deadlinegate/admission.go|./internal/deadlinegate|s/\n\s+AND s.lease_token = l.fencing_token//
+lease expiry not checked|internal/deadlinegate/admission.go|./internal/deadlinegate|s/\n\s+AND clock_timestamp\(\) < l\.expires_at//
 NULL answer admits|internal/deadlinegate/admission.go|./internal/deadlinegate|s/END,\n\s+false\),/END,\n         true),/
 no start record admits|internal/deadlinegate/admission.go|./internal/deadlinegate|s/return Decision\{\}, nil\n\t\}/return Decision{Admit: true, RequestTimeout: time.Hour}, nil\n\t}/
 publish queue accepted at start|internal/config/validation.go|./internal/config|s/if c\.PublishMQ\.GetQueueConfig\(\) != nil \{/if false {/
