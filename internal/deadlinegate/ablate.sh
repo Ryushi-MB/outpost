@@ -15,13 +15,13 @@ cd "$(dirname "$0")/../.."
 for v in MB_GATE_TEST_ADMIN_URL MB_GATE_TEST_GATE_URL MB_GATE_TEST_STANDBY_URL MB_GATE_TEST_GATE_TLS_URL; do
   [ -n "$(printenv "$v")" ] || { echo "ablate: set $v" >&2; exit 2; }
 done
-files=(internal/deadlinegate/gate.go internal/deadlinegate/admission.go internal/config/validation.go internal/services/builder.go internal/redis/fence.go internal/redis/redis.go internal/destregistry/providers/default.go)
+files=(internal/deadlinegate/gate.go internal/deadlinegate/admission.go internal/config/validation.go internal/services/builder.go internal/redis/fence.go internal/redis/redis.go internal/destregistry/providers/default.go internal/destregistry/httpclient.go internal/destregistry/providers/destwebhook/httphelper.go)
 backup="$(mktemp -d)"
 for f in "${files[@]}"; do mkdir -p "$backup/$(dirname "$f")"; cp "$f" "$backup/$f"; done
 restore() { for f in "${files[@]}"; do cp "$backup/$f" "$f"; done; }
 trap restore EXIT
 
-pkgs=(./internal/deadlinegate ./internal/config ./internal/services ./internal/redis ./internal/destregistry/providers)
+pkgs=(./internal/deadlinegate ./internal/config ./internal/services ./internal/redis ./internal/destregistry/providers ./internal/destregistry/providers/destwebhook)
 go test -count=1 "${pkgs[@]}" >/dev/null || { echo "ablate: the tests are not green before ablation" >&2; exit 1; }
 
 failed=0
@@ -101,5 +101,7 @@ Redis ignores the call's deadline (ContextTimeoutEnabled)|internal/redis/redis.g
 destination type not checked at the gate|internal/deadlinegate/gate.go|./internal/deadlinegate|s/if !destinationTypeAllowed\(r, body\) \{/if false {/
 destination type optional on create|internal/deadlinegate/gate.go|./internal/deadlinegate|s/return !route\.typeRequired/return true/
 a non-webhook provider registered|internal/destregistry/providers/default.go|./internal/destregistry/providers|s/registry\.RegisterProvider\("webhook", webhook\)/registry.RegisterProvider("webhook", webhook)\n\tregistry.RegisterProvider("rabbitmq", webhook)/
+redirects followed|internal/destregistry/httpclient.go|./internal/destregistry/providers/destwebhook|s/CheckRedirect: func\(\*http\.Request, \[\]\*http\.Request\) error \{ return http\.ErrUseLastResponse \},//
+a 3xx counted as delivered|internal/destregistry/providers/destwebhook/httphelper.go|./internal/destregistry/providers/destwebhook|s/if resp\.StatusCode < 200 \|\| resp\.StatusCode >= 300 \{/if resp.StatusCode >= 400 {/
 MUTATIONS
 exit "$failed"

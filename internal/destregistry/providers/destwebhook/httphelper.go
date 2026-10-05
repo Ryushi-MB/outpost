@@ -86,8 +86,9 @@ func ExecuteHTTPRequest(ctx context.Context, client *http.Client, req *http.Requ
 		}
 	}
 
-	// HTTP error response (4xx, 5xx)
-	if resp.StatusCode >= 400 {
+	// Only a 2xx acknowledges; any other status, a redirect included (it is never
+	// followed: destregistry.NewHTTPClient), is a failed attempt.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		delivery := &destregistry.Delivery{
 			Status: "failed",
 			Code:   fmt.Sprintf("%d", resp.StatusCode),
