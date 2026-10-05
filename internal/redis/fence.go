@@ -279,32 +279,37 @@ func setReply(c r.Cmder, v any) error {
 	return nil
 }
 
-// acceptanceTTL bounds how long an acceptance record is kept: longer than any delivery
-// queue backlog this service is expected to have.
-const acceptanceTTL = 7 * 24 * time.Hour
-
 // Acceptances writes and reads the acceptance records of gated publishes
-// (models.Acceptance).
-type Acceptances struct{ Client Cmdable }
+// (models.Acceptance). A record expires Retention after its call's fence, an absolute
+// time in Redis's clock, so a delivery worker can tell a record that was never written
+// (missing before that time) from one that may have expired (missing after it).
+// Retention comes from WEBHOOK_DEADLINE_GATE_ACCEPTANCE_RETENTION_HOURS, at least the 30
+// days the spec keeps deliveries retryable (config.ValidateMBWallet).
+type Acceptances struct {
+	Client    Cmdable
+	Retention time.Duration
+}
 
 // Pending returns the acceptance the tasks of the fenced call on ctx carry, or nil when
 // ctx carries no fence.
-func (Acceptances) Pending(ctx context.Context) *models.Acceptance {
+func (a Acceptances) Pending(ctx context.Context) *models.Acceptance {
 	f, ok := ctx.Value(fenceKey{}).(fence)
 	if !ok {
 		return nil
 	}
-	return &models.Acceptance{Key: "mbgate:accepted:" + f.token, Fence: f.until}
+	return &models.Acceptance{Key: "mbgate:accepted:" + f.token, Fence: f.until, Expires: f.until + a.Retention.Microseconds()}
 }
 
 // Accept writes the call's acceptance record. ctx carries the call's fence, so the write
-// is refused once the fence has passed.
+// is refused once the fence has passed. The record expires at Pending's Expires, rounded
+// up to the whole second EXAT takes, so it never expires before that time.
 func (a Acceptances) Accept(ctx context.Context) error {
 	p := a.Pending(ctx)
 	if p == nil {
 		return nil
 	}
-	return a.Client.Set(ctx, p.Key, "1", acceptanceTTL).Err()
+	expiresAt := time.Unix((p.Expires+999_999)/1_000_000, 0)
+	return a.Client.SetArgs(ctx, p.Key, "1", r.SetArgs{ExpireAt: expiresAt}).Err()
 }
 
 // awaitScript answers whether the record exists and Redis's clock, in one atomic read.
@@ -314,26 +319,29 @@ return {redis.call('EXISTS', KEYS[1]), tonumber(t[1]) * 1000000 + tonumber(t[2])
 `
 
 // Await reports whether a task's call was accepted. It waits while the record is missing
-// and the fence has not passed (the publish may still be writing it), and answers false
-// once Redis's clock has passed the fence with no record: from then on none can be
-// written.
-func (a Acceptances) Await(ctx context.Context, acc models.Acceptance) (bool, error) {
+// and the fence has not passed (the publish may still be writing it). Once Redis's clock
+// has passed the fence no record can be written, so a missing record before Expires means
+// the call never was accepted, and a missing record at or after Expires means the record
+// may have expired.
+func (a Acceptances) Await(ctx context.Context, acc models.Acceptance) (models.AcceptanceVerdict, error) {
 	for {
 		vals, err := a.Client.Eval(ctx, awaitScript, []string{acc.Key}).Slice()
 		if err != nil {
-			return false, err
+			return 0, err
 		}
 		exists, _ := vals[0].(int64)
 		now, _ := vals[1].(int64)
-		if exists == 1 {
-			return true, nil
-		}
-		if now >= acc.Fence {
-			return false, nil
+		switch {
+		case exists == 1:
+			return models.Accepted, nil
+		case now >= acc.Expires:
+			return models.RetentionPassed, nil
+		case now >= acc.Fence:
+			return models.NeverAccepted, nil
 		}
 		select {
 		case <-ctx.Done():
-			return false, ctx.Err()
+			return 0, ctx.Err()
 		case <-time.After(50 * time.Millisecond):
 		}
 	}

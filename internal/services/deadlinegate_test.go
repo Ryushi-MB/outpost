@@ -8,18 +8,61 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/hookdeck/outpost/internal/config"
 	"github.com/hookdeck/outpost/internal/logging"
+	"github.com/hookdeck/outpost/internal/proxychain/proxychaintest"
 	"github.com/hookdeck/outpost/internal/services"
 	"github.com/hookdeck/outpost/internal/telemetry"
 	"github.com/hookdeck/outpost/internal/util/testinfra"
 	"github.com/hookdeck/outpost/internal/util/testutil"
 	"github.com/stretchr/testify/require"
 )
+
+// mbWalletSettings gives c the settings every MB Wallet service starts with
+// (config.ValidateMBWallet). Deliveries leave through an in-process forward proxy, as they
+// leave through Smokescreen in the lane.
+func mbWalletSettings(t *testing.T, c *config.Config) {
+	t.Helper()
+	c.DeliveryTimeoutSeconds = config.MBWalletDeliveryTimeoutSeconds
+	c.RetrySchedule = slices.Clone(config.MBWalletRetrySchedule)
+	c.Destinations.ProxyURL = proxychaintest.New(t, false).URL
+	c.Telemetry.Disabled = true
+	c.DeadlineGate.AcceptanceRetentionHours = 720
+}
+
+// Every service type refuses to start outside MB Wallet's settings, before it opens any
+// connection (config.ValidateMBWallet owns the rules, one table row each).
+func TestEveryServiceRefusesToStartOutsideMBWalletSettings(t *testing.T) {
+	for _, service := range []config.ServiceType{config.ServiceTypeAll, config.ServiceTypeAPI, config.ServiceTypeDelivery, config.ServiceTypeLog} {
+		t.Run(service.String(), func(t *testing.T) {
+			c := &config.Config{}
+			c.InitDefaults()
+			mbWalletSettings(t, c)
+			c.Service = service.String()
+			c.RetrySchedule = nil // upstream's exponential backoff
+			// Addresses nothing listens on: the service must refuse before it dials any.
+			c.PostgresURL = "postgres://outpost@127.0.0.1:1/outpost?sslmode=disable"
+			c.MQs.RabbitMQ.ServerURL = "amqp://guest:guest@127.0.0.1:1"
+			c.Redis.Host, c.Redis.Port = "127.0.0.1", 1
+			c.AESEncryptionSecret = "encryptionsecret"
+			require.NoError(t, c.Validate(config.Flags{}))
+			logger, err := logging.NewLogger(logging.WithLogLevel("error"))
+			require.NoError(t, err)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			builder := services.NewServiceBuilder(ctx, c, logger, telemetry.New(logger, c.Telemetry.ToTelemetryConfig(), ""))
+			t.Cleanup(func() { builder.Cleanup(context.Background()) })
+			_, err = builder.BuildWorkers()
+			require.ErrorIs(t, err, config.ErrMBWalletSetting)
+			require.ErrorContains(t, err, "RETRY_SCHEDULE")
+		})
+	}
+}
 
 // The API service the builder starts runs behind MB Wallet's deadline gate, and its HTTP
 // server bounds the time a caller may take to send a request. Needs Docker (RabbitMQ and
@@ -48,6 +91,7 @@ func TestAPIServiceRunsBehindTheDeadlineGate(t *testing.T) {
 	c.DeadlineGate.DatabaseURL = gateURL
 	c.DeadlineGate.LocalPlaintext = true
 	c.DeadlineGate.RequestTimeoutMs = 500
+	mbWalletSettings(t, c)
 	require.NoError(t, c.Validate(config.Flags{}))
 
 	ctx, cancel := context.WithCancel(context.Background())

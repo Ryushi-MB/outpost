@@ -123,6 +123,7 @@ func startGatedAPI(t *testing.T, requestTimeout time.Duration, delivery bool) *g
 	c.DeadlineGate.DatabaseURL = gateURL
 	c.DeadlineGate.LocalPlaintext = true
 	c.DeadlineGate.RequestTimeoutMs = int(requestTimeout.Milliseconds())
+	mbWalletSettings(t, c)
 	// Exchange and queues of this test's own, declared as the app does at start.
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	c.MQs.RabbitMQ.Exchange, c.MQs.RabbitMQ.DeliveryQueue, c.MQs.RabbitMQ.LogQueue = "gate-"+suffix, "gate-delivery-"+suffix, "gate-log-"+suffix

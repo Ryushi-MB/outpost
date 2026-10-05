@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hookdeck/outpost/internal/models"
 	"github.com/hookdeck/outpost/internal/redis"
 	"github.com/hookdeck/outpost/internal/util/testinfra"
 	"github.com/hookdeck/outpost/internal/util/testutil"
@@ -78,16 +79,56 @@ func TestWriteFence(t *testing.T) {
 	})
 
 	t.Run("acceptance: a missing record is refused once the fence passes, not waited on", func(t *testing.T) {
-		acc := redis.Acceptances{Client: client}
+		acc := redis.Acceptances{Client: client, Retention: time.Hour}
 		fctx, err := fencer.Fence(ctx, time.Now().Add(300*time.Millisecond))
 		require.NoError(t, err)
 		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		start := time.Now()
-		ok, err := acc.Await(wctx, *acc.Pending(fctx))
+		verdict, err := acc.Await(wctx, *acc.Pending(fctx))
 		require.NoError(t, err)
-		require.False(t, ok)
+		require.Equal(t, models.NeverAccepted, verdict)
 		require.Less(t, time.Since(start), 2*time.Second)
+	})
+
+	// Retention accelerated to 2 s: an accepted publish reads as accepted until its record's
+	// expiry, and once the record is gone it reads as unknown, never as "not accepted" (the
+	// c00e0038 defect: an accepted task consumed after expiry was dropped). A publish that
+	// never wrote its record reads as not accepted until then.
+	t.Run("acceptance: a record lives to its retention, and past it absence is not refusal", func(t *testing.T) {
+		const retention = 2 * time.Second
+		acc := redis.Acceptances{Client: client, Retention: retention}
+		actx, err := fencer.Fence(ctx, time.Now().Add(200*time.Millisecond))
+		require.NoError(t, err)
+		accepted := *acc.Pending(actx)
+		require.NoError(t, acc.Accept(actx))
+		nctx, err := fencer.Fence(ctx, time.Now().Add(200*time.Millisecond))
+		require.NoError(t, err)
+		never := *acc.Pending(nctx)
+		require.Equal(t, accepted.Fence+retention.Microseconds(), accepted.Expires)
+
+		verdict := func(a models.Acceptance) models.AcceptanceVerdict {
+			wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			v, err := acc.Await(wctx, a)
+			require.NoError(t, err)
+			return v
+		}
+		// redisNow is Redis's clock in microseconds, the clock Fence and Expires are in.
+		redisNow := func() int64 { tm, err := raw.Time(ctx).Result(); require.NoError(t, err); return tm.UnixMicro() }
+		sleepUntil := func(us int64) { time.Sleep(time.Duration(us-redisNow()) * time.Microsecond) }
+
+		sleepUntil(accepted.Fence + 100_000)
+		require.Equal(t, models.Accepted, verdict(accepted), "after the fence")
+		require.Equal(t, models.NeverAccepted, verdict(never), "after the fence")
+		sleepUntil(accepted.Expires - 200_000)
+		require.Equal(t, models.Accepted, verdict(accepted), "just before its expiry the record must still exist")
+		require.Equal(t, models.NeverAccepted, verdict(never), "just before its expiry")
+		// EXAT rounds the expiry up to a whole second.
+		sleepUntil(accepted.Expires + 1_100_000)
+		require.Equal(t, int64(0), raw.Exists(ctx, accepted.Key).Val(), "the record outlived its retention by more than a second")
+		require.Equal(t, models.RetentionPassed, verdict(accepted), "an expired accepted record read as never accepted")
+		require.Equal(t, models.RetentionPassed, verdict(never))
 	})
 
 	t.Run("a paused Redis releases the caller at its context deadline", func(t *testing.T) {

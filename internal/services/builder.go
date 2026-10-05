@@ -79,6 +79,11 @@ func (b *ServiceBuilder) BuildWorkers() (*worker.WorkerSupervisor, error) {
 	serviceType := b.cfg.MustGetService()
 	b.logger.Debug("building workers for service type", zap.String("service_type", serviceType.String()))
 
+	// MB Wallet's delivery rules and egress (config.ValidateMBWallet), for every service type.
+	if err := b.cfg.ValidateMBWallet(); err != nil {
+		return nil, err
+	}
+
 	// Create base router with health check that all services will extend
 	b.logger.Debug("creating base router with health check")
 	baseRouter := NewBaseRouter(b.supervisor, b.cfg.GinMode, b.cfg.PprofEnabled)
@@ -223,7 +228,7 @@ func (b *ServiceBuilder) BuildAPIWorkers(baseRouter *gin.Engine) error {
 		b.cfg.Topics,
 		b.cfg.TopicsAllowWildcards,
 		publishIdempotence,
-		publishmq.WithAcceptor(redis.Acceptances{Client: svc.redisClient}),
+		publishmq.WithAcceptor(b.acceptances(svc.redisClient)),
 	)
 
 	// Create operator events emitter for subscription updates
@@ -359,7 +364,7 @@ func (b *ServiceBuilder) BuildDeliveryWorker(baseRouter *gin.Engine) error {
 		retryBackoff,
 		retryMaxLimit,
 		deliveryIdempotence,
-		deliverymq.WithAcceptance(redis.Acceptances{Client: svc.redisClient}),
+		deliverymq.WithAcceptance(b.acceptances(svc.redisClient)),
 	)
 
 	svc.router = baseRouter
@@ -662,4 +667,10 @@ func (s *serviceInstance) initRetryScheduler(ctx context.Context, cfg *config.Co
 	})
 	s.retryScheduler = retryScheduler
 	return nil
+}
+
+// acceptances reads and writes gated publishes' acceptance records, kept for the
+// configured acceptance retention after each call's cut-off.
+func (b *ServiceBuilder) acceptances(client redis.Client) redis.Acceptances {
+	return redis.Acceptances{Client: client, Retention: time.Duration(b.cfg.DeadlineGate.AcceptanceRetentionHours) * time.Hour}
 }

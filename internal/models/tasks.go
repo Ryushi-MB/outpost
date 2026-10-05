@@ -50,11 +50,28 @@ type DeliveryTask struct {
 // enqueued; Fence is the call's fence in Redis server microseconds. Once Redis's clock
 // has passed Fence the record can no longer be written, so a task whose record is still
 // missing then was enqueued by a call that did not complete before its cut-off, and is
-// never delivered.
+// never delivered. Expires is when a written record expires, in Redis server
+// microseconds: Fence plus the acceptance retention. A record missing at or after Expires
+// may have been written and expired, so its absence no longer says the call failed.
 type Acceptance struct {
-	Key   string `json:"key"`
-	Fence int64  `json:"fence"`
+	Key     string `json:"key"`
+	Fence   int64  `json:"fence"`
+	Expires int64  `json:"expires"`
 }
+
+// AcceptanceVerdict is what a delivery worker learns about a task's acceptance.
+type AcceptanceVerdict int
+
+const (
+	// Accepted: the record exists, so the publish was accepted before its cut-off.
+	Accepted AcceptanceVerdict = iota + 1
+	// NeverAccepted: the fence has passed, the record is missing and could not have
+	// expired yet, so the publish never completed before its cut-off.
+	NeverAccepted
+	// RetentionPassed: the record is missing at or after its expiry, so whether the
+	// publish was accepted is no longer known.
+	RetentionPassed
+)
 
 var _ mqs.IncomingMessage = &DeliveryTask{}
 
