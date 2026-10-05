@@ -204,6 +204,7 @@ func (b *ServiceBuilder) BuildAPIWorkers(baseRouter *gin.Engine) error {
 		b.cfg.DeadlineGate.PreviousSecret,
 		time.Duration(b.cfg.DeadlineGate.RequestTimeoutMs)*time.Millisecond,
 		gateDB,
+		redis.Fencer{Client: svc.redisClient},
 	)
 	if err != nil {
 		return err

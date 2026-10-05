@@ -51,6 +51,14 @@ func (f *fakeAdmitter) Admit(ctx context.Context, a Admission) (Decision, error)
 	return f.decision, f.err
 }
 
+// fakeFencer stands in for the Redis write fence (internal/redis.Fencer, proved against a
+// paused Redis in internal/services). It passes the context through, or fails.
+type fakeFencer struct{ err error }
+
+func (f fakeFencer) Fence(ctx context.Context, _ time.Time) (context.Context, error) {
+	return ctx, f.err
+}
+
 type call struct {
 	method  string
 	target  string
@@ -113,11 +121,25 @@ func run(t *testing.T, g *Gate, a *fakeAdmitter, c call) (outcome, *fakeAdmitter
 
 func newGate(t *testing.T, a *fakeAdmitter, previous string, timeout time.Duration) *Gate {
 	t.Helper()
-	g, err := New(string(keyCurrent), previous, timeout, a)
+	g, err := New(string(keyCurrent), previous, timeout, a, fakeFencer{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	return g
+}
+
+// A call whose writes cannot be fenced is refused before the service starts: without the
+// fence a write could land after the cut-off.
+func TestFenceFailureRefusesTheCall(t *testing.T) {
+	a := &fakeAdmitter{decision: Decision{Admit: true, RequestTimeout: 10 * time.Second}}
+	g, err := New(string(keyCurrent), "", 10*time.Second, a, fakeFencer{err: errors.New("redis: TIME timed out")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := run(t, g, a, signed(keyCurrent, http.MethodPost, "/api/v1/publish", publishBody, "publish"))
+	if want := (outcome{status: http.StatusServiceUnavailable, admitted: true}); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
 }
 
 const publishBody = `{"tenant_id":"` + tenant + `","topic":"payout.sent","data":{"x":1}}`
@@ -399,6 +421,7 @@ func TestNewRefusesAGateThatCouldNotDeny(t *testing.T) {
 		current, previous string
 		timeout           time.Duration
 		admitter          Admitter
+		noFence           bool
 	}{
 		{name: "no secret", current: "", timeout: time.Second, admitter: a},
 		{name: "short secret", current: "short", timeout: time.Second, admitter: a},
@@ -406,10 +429,15 @@ func TestNewRefusesAGateThatCouldNotDeny(t *testing.T) {
 		{name: "previous equals current", current: string(keyCurrent), previous: string(keyCurrent), timeout: time.Second, admitter: a},
 		{name: "no timeout", current: string(keyCurrent), timeout: 0, admitter: a},
 		{name: "no database", current: string(keyCurrent), timeout: time.Second, admitter: nil},
+		{name: "no write fence", current: string(keyCurrent), timeout: time.Second, admitter: a, noFence: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := New(tc.current, tc.previous, tc.timeout, tc.admitter); err == nil {
+			var fencer Fencer = fakeFencer{}
+			if tc.noFence {
+				fencer = nil
+			}
+			if _, err := New(tc.current, tc.previous, tc.timeout, tc.admitter, fencer); err == nil {
 				t.Fatal("New accepted a configuration that cannot enforce the gate")
 			}
 		})

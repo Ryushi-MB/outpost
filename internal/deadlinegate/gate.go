@@ -8,6 +8,10 @@
 // the gate's configured request timeout and the one stored on its start record, both
 // measured from the gate's own monotonic timer. The gate never reads its host's clock to
 // decide anything: whether D has passed is the database's answer.
+//
+// Cutting off the response does not stop the handler's work, so an admitted call also
+// carries a write fence (Fencer; internal/redis.Fencer in the service): a Redis write the
+// call makes commits before the cut-off or is refused by Redis itself.
 package deadlinegate
 
 import (
@@ -87,16 +91,25 @@ type Admitter interface {
 	Admit(ctx context.Context, a Admission) (Decision, error)
 }
 
+// Fencer binds the writes an admitted call makes to its cut-off, so that a write its store
+// has not committed by then is refused by the store itself. A response cut off by the
+// TimeoutHandler does not stop the handler's work; the fence does. It returns ctx carrying
+// the fence. An error refuses the call before the service starts.
+type Fencer interface {
+	Fence(ctx context.Context, cutOff time.Time) (context.Context, error)
+}
+
 type Gate struct {
 	keys           [][]byte
 	requestTimeout time.Duration
 	admitter       Admitter
+	fencer         Fencer
 }
 
 // New builds a gate. It refuses any configuration under which the gate could not deny:
 // no or a short secret, a previous secret equal to the current one, no request timeout,
-// or no database.
-func New(current, previous string, requestTimeout time.Duration, admitter Admitter) (*Gate, error) {
+// no database, or no write fence.
+func New(current, previous string, requestTimeout time.Duration, admitter Admitter, fencer Fencer) (*Gate, error) {
 	if len(current) < minSecretBytes {
 		return nil, fmt.Errorf("deadline gate: WEBHOOK_DEADLINE_SECRET must be at least %d bytes", minSecretBytes)
 	}
@@ -116,7 +129,10 @@ func New(current, previous string, requestTimeout time.Duration, admitter Admitt
 	if admitter == nil {
 		return nil, errors.New("deadline gate: the gate database must be set")
 	}
-	return &Gate{keys: keys, requestTimeout: requestTimeout, admitter: admitter}, nil
+	if fencer == nil {
+		return nil, errors.New("deadline gate: the write fence must be set")
+	}
+	return &Gate{keys: keys, requestTimeout: requestTimeout, admitter: admitter, fencer: fencer}, nil
 }
 
 // Sign returns the Mb-Deadline-Sig value for a call: "v1=" and the hex HMAC-SHA256, keyed
@@ -308,11 +324,18 @@ func (g *Gate) Wrap(next http.Handler) http.Handler {
 			return
 		}
 		limit := min(g.requestTimeout, d.RequestTimeout)
-		remaining := limit - time.Since(start)
+		cutOff := start.Add(limit) // keeps start's monotonic reading
+		fenced, err := g.fencer.Fence(r.Context(), cutOff)
+		if err != nil {
+			refuse(w, http.StatusServiceUnavailable, "write fence unavailable")
+			return
+		}
+		remaining := time.Until(cutOff)
 		if remaining <= 0 {
 			refuse(w, http.StatusServiceUnavailable, "request timeout spent before admission")
 			return
 		}
+		r = r.WithContext(fenced)
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
 		http.TimeoutHandler(next, remaining, cutOffBody).ServeHTTP(w, r)

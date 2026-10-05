@@ -8,19 +8,20 @@
 #   STANDBY_URL  a streaming standby of it, as mbwallet_neon_webhook_gate
 #   GATE_TLS_URL the primary as mbwallet_neon_webhook_gate with sslmode=verify-full
 # The database checks skip without them, and the wiring rows (./internal/services) need
-# Docker, so the script refuses rather than count a skip as red.
+# Docker, as do the write-fence rows (./internal/redis, ./internal/services: Redis Stack),
+# so the script refuses rather than count a skip as red.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 for v in MB_GATE_TEST_ADMIN_URL MB_GATE_TEST_GATE_URL MB_GATE_TEST_STANDBY_URL MB_GATE_TEST_GATE_TLS_URL; do
   [ -n "$(printenv "$v")" ] || { echo "ablate: set $v" >&2; exit 2; }
 done
-files=(internal/deadlinegate/gate.go internal/deadlinegate/admission.go internal/config/validation.go internal/services/builder.go)
+files=(internal/deadlinegate/gate.go internal/deadlinegate/admission.go internal/config/validation.go internal/services/builder.go internal/redis/fence.go internal/redis/redis.go)
 backup="$(mktemp -d)"
 for f in "${files[@]}"; do mkdir -p "$backup/$(dirname "$f")"; cp "$f" "$backup/$f"; done
 restore() { for f in "${files[@]}"; do cp "$backup/$f" "$f"; done; }
 trap restore EXIT
 
-pkgs=(./internal/deadlinegate ./internal/config ./internal/services)
+pkgs=(./internal/deadlinegate ./internal/config ./internal/services ./internal/redis)
 go test -count=1 "${pkgs[@]}" >/dev/null || { echo "ablate: the tests are not green before ablation" >&2; exit 1; }
 
 failed=0
@@ -62,7 +63,7 @@ read error admits|internal/deadlinegate/gate.go|./internal/deadlinegate|s/if err
 database refusal ignored|internal/deadlinegate/gate.go|./internal/deadlinegate|s/if !d.Admit \{/if false {/
 cut-off ignores the stored timeout|internal/deadlinegate/gate.go|./internal/deadlinegate|s/min\(g.requestTimeout, d.RequestTimeout\)/g.requestTimeout/
 cut-off ignores the configured timeout|internal/deadlinegate/gate.go|./internal/deadlinegate|s/min\(g.requestTimeout, d.RequestTimeout\)/d.RequestTimeout/
-cut-off not measured from the timer start|internal/deadlinegate/gate.go|./internal/deadlinegate|s/remaining := limit - time.Since\(start\)/remaining := limit/
+cut-off not measured from the timer start|internal/deadlinegate/gate.go|./internal/deadlinegate|s/cutOff := start\.Add\(limit\)/cutOff := time.Now().Add(limit)/
 spent timeout still starts the service (remaining <= 0)|internal/deadlinegate/gate.go|./internal/deadlinegate|s/if remaining <= 0 \{/if false {/
 no cut-off (TimeoutHandler removed)|internal/deadlinegate/gate.go|./internal/deadlinegate|s/http\.TimeoutHandler\(next, remaining, cutOffBody\)\.ServeHTTP\(w, r\)/next.ServeHTTP(w, r)/
 body not replayed to the service|internal/deadlinegate/gate.go|./internal/deadlinegate|s/r\.Body = io\.NopCloser\(bytes\.NewReader\(body\)\)/r.Body = io.NopCloser(bytes.NewReader(nil))/
@@ -89,5 +90,13 @@ no start record admits|internal/deadlinegate/admission.go|./internal/deadlinegat
 publish queue accepted at start|internal/config/validation.go|./internal/config|s/if c\.PublishMQ\.GetQueueConfig\(\) != nil \{/if false {/
 gate not wrapped around the API|internal/services/builder.go|./internal/services|s/gate\.Wrap\(apiHandler\)/func() http.Handler { _ = gate; return apiHandler }()/
 no server read timeout|internal/services/builder.go|./internal/services|s/\t\tReadTimeout: time\.Duration\(b\.cfg\.DeadlineGate\.RequestTimeoutMs\) \* time\.Millisecond,\n//
+write fence not handed to the service|internal/deadlinegate/gate.go|./internal/services|s/r = r\.WithContext\(fenced\)/_ = fenced/
+write fence failure ignored|internal/deadlinegate/gate.go|./internal/deadlinegate|s/if err != nil \{\n\t\t\trefuse\(w, http.StatusServiceUnavailable, "write fence unavailable"\)/if false \&\& err != nil {\n\t\t\trefuse(w, http.StatusServiceUnavailable, "write fence unavailable")/
+no write fence accepted|internal/deadlinegate/gate.go|./internal/deadlinegate|s/if fencer == nil \{/if false {/
+Redis clock not checked before the write|internal/redis/fence.go|./internal/redis|s/if now >= tonumber\(ARGV\[1\]\) then/if false then/
+fence not tied to the cut-off|internal/redis/fence.go|./internal/redis|s/now\.UnixMicro\(\)\+left\.Microseconds\(\)/now.UnixMicro()+left.Microseconds()+3600000000/
+unknown write passes under a fence|internal/redis/fence.go|./internal/redis|s/if !known \{/if false {/
+fence hook not installed|internal/redis/redis.go|./internal/redis|s/hooked\.AddHook\(fenceHook\{\}\)/_ = hooked/
+Redis ignores the call's deadline (ContextTimeoutEnabled)|internal/redis/redis.go|./internal/redis|s/\/\/ See createClusterClient\.\n\t\tContextTimeoutEnabled: true,\n//
 MUTATIONS
 exit "$failed"
