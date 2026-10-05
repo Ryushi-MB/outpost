@@ -115,9 +115,9 @@ redirects followed|internal/destregistry/httpclient.go|./internal/destregistry/p
 a 3xx counted as delivered|internal/destregistry/providers/destwebhook/httphelper.go|./internal/destregistry/providers/destwebhook|s/if resp\.StatusCode < 200 \|\| resp\.StatusCode >= 300 \{/if resp.StatusCode >= 400 {/
 late enqueue: tasks not stamped with their acceptance|internal/publishmq/eventhandler.go|./internal/services|s/task\.Acceptance = acceptance/_ = acceptance/
 late enqueue: acceptance record never written|internal/redis/fence.go|./internal/services|s/return a\.Client\.Set\(ctx, p\.Key, "1", acceptanceTTL\)\.Err\(\)/return nil/
-late enqueue: consumer delivers an unaccepted task|internal/deliverymq/messagehandler.go|./internal/services|s/if !accepted \{/if false {/
+late enqueue: consumer delivers an unaccepted task|internal/deliverymq/messagehandler.go|./internal/services|s/if !accepted \{/if !accepted \&\& false {/
 late enqueue: publish acceptor not wired|internal/services/builder.go|./internal/services|s/\t\tpublishmq\.WithAcceptor\(redis\.Acceptances\{Client: svc\.redisClient\}\),\n//
 late enqueue: consumer acceptance check not wired|internal/services/builder.go|./internal/services|s/\t\tdeliverymq\.WithAcceptance\(redis\.Acceptances\{Client: svc\.redisClient\}\),\n//
-late enqueue: a missing record is never final|internal/redis/fence.go|./internal/redis|s/if now >= acc\.Fence \{/if false {/
+late enqueue: a missing record is never final|internal/redis/fence.go|./internal/redis|s/if now >= acc\.Fence \{/if now >= acc.Fence \&\& false {/
 MUTATIONS
 exit "$failed"
