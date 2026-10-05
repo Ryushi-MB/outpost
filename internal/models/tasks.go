@@ -40,6 +40,20 @@ type DeliveryTask struct {
 	Attempt       int                `json:"attempt"`
 	Manual        bool               `json:"manual"`
 	Telemetry     *DeliveryTelemetry `json:"telemetry,omitempty"`
+	// Acceptance is set on the tasks a publish admitted by MB Wallet's deadline gate
+	// enqueues. Such a task is delivered only once its call's acceptance record exists.
+	Acceptance *Acceptance `json:"mb_acceptance,omitempty"`
+}
+
+// Acceptance ties a delivery task to the gated call that published it. Key names the
+// record the call writes, through the Redis write fence, after every one of its tasks is
+// enqueued; Fence is the call's fence in Redis server microseconds. Once Redis's clock
+// has passed Fence the record can no longer be written, so a task whose record is still
+// missing then was enqueued by a call that did not complete before its cut-off, and is
+// never delivered.
+type Acceptance struct {
+	Key   string `json:"key"`
+	Fence int64  `json:"fence"`
 }
 
 var _ mqs.IncomingMessage = &DeliveryTask{}

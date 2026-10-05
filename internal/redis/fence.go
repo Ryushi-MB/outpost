@@ -2,12 +2,15 @@ package redis
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"time"
 
+	"github.com/hookdeck/outpost/internal/models"
 	r "github.com/redis/go-redis/v9"
 )
 
@@ -27,10 +30,17 @@ var ErrFenced = errors.New("redis write fence: the call was cut off at its reque
 
 type fenceKey struct{}
 
+// fence is what a fenced call's context carries: the fence in Redis server microseconds,
+// and a token naming the call's acceptance record (Acceptances).
+type fence struct {
+	until int64
+	token string
+}
+
 // fenceOf returns the fence on ctx, in Redis server microseconds.
 func fenceOf(ctx context.Context) (int64, bool) {
-	until, ok := ctx.Value(fenceKey{}).(int64)
-	return until, ok
+	f, ok := ctx.Value(fenceKey{}).(fence)
+	return f.until, ok
 }
 
 // Fencer binds a call's Redis writes to its cut-off.
@@ -49,7 +59,11 @@ func (f Fencer) Fence(ctx context.Context, cutOff time.Time) (context.Context, e
 	if left <= 0 {
 		return nil, ErrFenced
 	}
-	return context.WithValue(ctx, fenceKey{}, now.UnixMicro()+left.Microseconds()), nil
+	token := make([]byte, 16)
+	if _, err := rand.Read(token); err != nil {
+		return nil, err
+	}
+	return context.WithValue(ctx, fenceKey{}, fence{until: now.UnixMicro() + left.Microseconds(), token: hex.EncodeToString(token)}), nil
 }
 
 // fencedScript runs its commands only while Redis's clock is before the fence.
@@ -263,4 +277,64 @@ func setReply(c r.Cmder, v any) error {
 		return fmt.Errorf("redis write fence: no reply mapping for %T (%s)", c, c.Name())
 	}
 	return nil
+}
+
+// acceptanceTTL bounds how long an acceptance record is kept: longer than any delivery
+// queue backlog this service is expected to have.
+const acceptanceTTL = 7 * 24 * time.Hour
+
+// Acceptances writes and reads the acceptance records of gated publishes
+// (models.Acceptance).
+type Acceptances struct{ Client Cmdable }
+
+// Pending returns the acceptance the tasks of the fenced call on ctx carry, or nil when
+// ctx carries no fence.
+func (Acceptances) Pending(ctx context.Context) *models.Acceptance {
+	f, ok := ctx.Value(fenceKey{}).(fence)
+	if !ok {
+		return nil
+	}
+	return &models.Acceptance{Key: "mbgate:accepted:" + f.token, Fence: f.until}
+}
+
+// Accept writes the call's acceptance record. ctx carries the call's fence, so the write
+// is refused once the fence has passed.
+func (a Acceptances) Accept(ctx context.Context) error {
+	p := a.Pending(ctx)
+	if p == nil {
+		return nil
+	}
+	return a.Client.Set(ctx, p.Key, "1", acceptanceTTL).Err()
+}
+
+// awaitScript answers whether the record exists and Redis's clock, in one atomic read.
+const awaitScript = `
+local t = redis.call('TIME')
+return {redis.call('EXISTS', KEYS[1]), tonumber(t[1]) * 1000000 + tonumber(t[2])}
+`
+
+// Await reports whether a task's call was accepted. It waits while the record is missing
+// and the fence has not passed (the publish may still be writing it), and answers false
+// once Redis's clock has passed the fence with no record: from then on none can be
+// written.
+func (a Acceptances) Await(ctx context.Context, acc models.Acceptance) (bool, error) {
+	for {
+		vals, err := a.Client.Eval(ctx, awaitScript, []string{acc.Key}).Slice()
+		if err != nil {
+			return false, err
+		}
+		exists, _ := vals[0].(int64)
+		now, _ := vals[1].(int64)
+		if exists == 1 {
+			return true, nil
+		}
+		if now >= acc.Fence {
+			return false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }

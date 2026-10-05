@@ -74,6 +74,21 @@ type messageHandler struct {
 	retryMaxLimit  int
 	idempotence    idempotence.Idempotence
 	publisher      Publisher
+	acceptance     AcceptanceAwaiter
+}
+
+// AcceptanceAwaiter answers whether a gated publish was accepted (models.Acceptance),
+// waiting while that can still change.
+type AcceptanceAwaiter interface {
+	Await(ctx context.Context, acc models.Acceptance) (bool, error)
+}
+
+type MessageHandlerOption func(*messageHandler)
+
+// WithAcceptance delivers a task that carries an acceptance only once its publish is
+// accepted, and drops it when it never was. Without it such a task is never delivered.
+func WithAcceptance(a AcceptanceAwaiter) MessageHandlerOption {
+	return func(h *messageHandler) { h.acceptance = a }
 }
 
 type Publisher interface {
@@ -107,8 +122,9 @@ func NewMessageHandler(
 	retryBackoff backoff.Backoff,
 	retryMaxLimit int,
 	idempotence idempotence.Idempotence,
+	opts ...MessageHandlerOption,
 ) consumer.MessageHandler {
-	return &messageHandler{
+	h := &messageHandler{
 		eventTracer:    eventTracer,
 		logger:         logger,
 		logMQ:          logMQ,
@@ -119,6 +135,10 @@ func NewMessageHandler(
 		retryMaxLimit:  retryMaxLimit,
 		idempotence:    idempotence,
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 func (h *messageHandler) Handle(ctx context.Context, msg *mqs.Message) error {
@@ -126,6 +146,26 @@ func (h *messageHandler) Handle(ctx context.Context, msg *mqs.Message) error {
 
 	if err := task.FromMessage(msg); err != nil {
 		return h.handleError(msg, &PreDeliveryError{err: err})
+	}
+
+	// A task of a gated publish is delivered only if that publish was accepted before its
+	// cut-off; one enqueued by a call that never completed in time is dropped.
+	if task.Acceptance != nil {
+		accepted := false
+		if h.acceptance != nil {
+			var err error
+			if accepted, err = h.acceptance.Await(ctx, *task.Acceptance); err != nil {
+				return h.handleError(msg, &PreDeliveryError{err: err})
+			}
+		}
+		if !accepted {
+			h.logger.Ctx(ctx).Warn("delivery task dropped: its publish was not accepted before its cut-off",
+				zap.String("event_id", task.Event.ID),
+				zap.String("tenant_id", task.Event.TenantID),
+				zap.String("destination_id", task.DestinationID))
+			msg.Ack()
+			return nil
+		}
 	}
 
 	h.logger.Ctx(ctx).Debug("processing delivery task",

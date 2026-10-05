@@ -15,7 +15,7 @@ cd "$(dirname "$0")/../.."
 for v in MB_GATE_TEST_ADMIN_URL MB_GATE_TEST_GATE_URL MB_GATE_TEST_STANDBY_URL MB_GATE_TEST_GATE_TLS_URL; do
   [ -n "$(printenv "$v")" ] || { echo "ablate: set $v" >&2; exit 2; }
 done
-files=(internal/deadlinegate/gate.go internal/deadlinegate/admission.go internal/config/validation.go internal/services/builder.go internal/redis/fence.go internal/redis/redis.go internal/destregistry/providers/default.go internal/destregistry/httpclient.go internal/destregistry/providers/destwebhook/httphelper.go)
+files=(internal/deadlinegate/gate.go internal/deadlinegate/admission.go internal/config/validation.go internal/services/builder.go internal/redis/fence.go internal/redis/redis.go internal/destregistry/providers/default.go internal/destregistry/httpclient.go internal/destregistry/providers/destwebhook/httphelper.go internal/publishmq/eventhandler.go internal/deliverymq/messagehandler.go)
 backup="$(mktemp -d)"
 for f in "${files[@]}"; do mkdir -p "$backup/$(dirname "$f")"; cp "$f" "$backup/$f"; done
 restore() { for f in "${files[@]}"; do cp "$backup/$f" "$f"; done; }
@@ -26,7 +26,7 @@ pkgs=(./internal/deadlinegate ./internal/config ./internal/services ./internal/r
 # row does not rerun upstream's container suites (a loaded Docker Desktop makes those slow
 # and flaky). Every other package runs whole.
 declare -A only=(
-  [./internal/services]='^(TestAPIServiceRunsBehindTheDeadlineGate|TestAGatedWriteCannotLandAfterTheCutOff|TestOnlyWebhookDestinationsCanBeCreated)$'
+  [./internal/services]='^(TestAPIServiceRunsBehindTheDeadlineGate|TestAGatedWriteCannotLandAfterTheCutOff|TestOnlyWebhookDestinationsCanBeCreated|TestALateEnqueueIsNeverDelivered)$'
   [./internal/redis]='^TestWriteFence$'
 )
 gotest() { go test -count=1 ${only[$1]:+-run "${only[$1]}"} "$1"; }
@@ -104,7 +104,7 @@ write fence not handed to the service|internal/deadlinegate/gate.go|./internal/s
 write fence failure ignored|internal/deadlinegate/gate.go|./internal/deadlinegate|s/if err != nil \{\n\t\t\trefuse\(w, http.StatusServiceUnavailable, "write fence unavailable"\)/if false \&\& err != nil {\n\t\t\trefuse(w, http.StatusServiceUnavailable, "write fence unavailable")/
 no write fence accepted|internal/deadlinegate/gate.go|./internal/deadlinegate|s/if fencer == nil \{/if false {/
 Redis clock not checked before the write|internal/redis/fence.go|./internal/redis|s/if now >= tonumber\(ARGV\[1\]\) then/if false then/
-fence not tied to the cut-off|internal/redis/fence.go|./internal/redis|s/now\.UnixMicro\(\)\+left\.Microseconds\(\)/now.UnixMicro()+left.Microseconds()+3600000000/
+fence not tied to the cut-off|internal/redis/fence.go|./internal/redis|s/until: now\.UnixMicro\(\) \+ left\.Microseconds\(\)/until: now.UnixMicro() + left.Microseconds() + 3600000000/
 unknown write passes under a fence|internal/redis/fence.go|./internal/redis|s/if !known \{/if !known \&\& false {/
 fence hook not installed|internal/redis/redis.go|./internal/redis|s/hooked\.AddHook\(fenceHook\{\}\)/_ = hooked/
 Redis ignores the call's deadline (ContextTimeoutEnabled)|internal/redis/redis.go|./internal/redis|s/\/\/ See createClusterClient\.\n\t\tContextTimeoutEnabled: true,\n//
@@ -113,5 +113,11 @@ destination type optional on create|internal/deadlinegate/gate.go|./internal/dea
 a non-webhook provider registered|internal/destregistry/providers/default.go|./internal/destregistry/providers|s/registry\.RegisterProvider\("webhook", webhook\)/registry.RegisterProvider("webhook", webhook)\n\tregistry.RegisterProvider("rabbitmq", webhook)/
 redirects followed|internal/destregistry/httpclient.go|./internal/destregistry/providers/destwebhook|s/CheckRedirect: func\(\*http\.Request, \[\]\*http\.Request\) error \{ return http\.ErrUseLastResponse \},//
 a 3xx counted as delivered|internal/destregistry/providers/destwebhook/httphelper.go|./internal/destregistry/providers/destwebhook|s/if resp\.StatusCode < 200 \|\| resp\.StatusCode >= 300 \{/if resp.StatusCode >= 400 {/
+late enqueue: tasks not stamped with their acceptance|internal/publishmq/eventhandler.go|./internal/services|s/task\.Acceptance = acceptance/_ = acceptance/
+late enqueue: acceptance record never written|internal/redis/fence.go|./internal/services|s/return a\.Client\.Set\(ctx, p\.Key, "1", acceptanceTTL\)\.Err\(\)/return nil/
+late enqueue: consumer delivers an unaccepted task|internal/deliverymq/messagehandler.go|./internal/services|s/if !accepted \{/if false {/
+late enqueue: publish acceptor not wired|internal/services/builder.go|./internal/services|s/\t\tpublishmq\.WithAcceptor\(redis\.Acceptances\{Client: svc\.redisClient\}\),\n//
+late enqueue: consumer acceptance check not wired|internal/services/builder.go|./internal/services|s/\t\tdeliverymq\.WithAcceptance\(redis\.Acceptances\{Client: svc\.redisClient\}\),\n//
+late enqueue: a missing record is never final|internal/redis/fence.go|./internal/redis|s/if now >= acc\.Fence \{/if false {/
 MUTATIONS
 exit "$failed"

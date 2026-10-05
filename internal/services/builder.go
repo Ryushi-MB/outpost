@@ -223,6 +223,7 @@ func (b *ServiceBuilder) BuildAPIWorkers(baseRouter *gin.Engine) error {
 		b.cfg.Topics,
 		b.cfg.TopicsAllowWildcards,
 		publishIdempotence,
+		publishmq.WithAcceptor(redis.Acceptances{Client: svc.redisClient}),
 	)
 
 	// Create operator events emitter for subscription updates
@@ -358,6 +359,7 @@ func (b *ServiceBuilder) BuildDeliveryWorker(baseRouter *gin.Engine) error {
 		retryBackoff,
 		retryMaxLimit,
 		deliveryIdempotence,
+		deliverymq.WithAcceptance(redis.Acceptances{Client: svc.redisClient}),
 	)
 
 	svc.router = baseRouter

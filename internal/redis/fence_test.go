@@ -77,6 +77,19 @@ func TestWriteFence(t *testing.T) {
 		require.Equal(t, int64(1), raw.Exists(ctx, "unknown:a").Val())
 	})
 
+	t.Run("acceptance: a missing record is refused once the fence passes, not waited on", func(t *testing.T) {
+		acc := redis.Acceptances{Client: client}
+		fctx, err := fencer.Fence(ctx, time.Now().Add(300*time.Millisecond))
+		require.NoError(t, err)
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		start := time.Now()
+		ok, err := acc.Await(wctx, *acc.Pending(fctx))
+		require.NoError(t, err)
+		require.False(t, ok)
+		require.Less(t, time.Since(start), 2*time.Second)
+	})
+
 	t.Run("a paused Redis releases the caller at its context deadline", func(t *testing.T) {
 		require.NoError(t, raw.Do(ctx, "CLIENT", "PAUSE", 1500, "WRITE").Err())
 		tctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
