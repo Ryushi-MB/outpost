@@ -32,8 +32,10 @@ func (a *gatedAPI) startRecord(t *testing.T, kind, mode, accessState, marker str
 	}
 	var r gatedRecord
 	require.NoError(t, a.admin.QueryRow(ctx, `
-		INSERT INTO outbound_start_records (org_id, mode, kind, created_at, deadline, lease_token, access_state, cycle_marker, request_timeout_ms)
-		VALUES ($1, $2, $3, clock_timestamp(), date_trunc('microseconds', clock_timestamp() + interval '1 hour'), $4, $5, $6::uuid, 10000)
+		WITH t AS (SELECT date_trunc('microseconds', clock_timestamp()) AS created)
+		INSERT INTO outbound_start_records (org_id, mode, kind, created_at, deadline, lease_token, access_state, cycle_marker,
+		  request_timeout_ms, transaction_timeout_ms, proxy_call_timeout_ms)
+		SELECT $1, $2, $3, t.created, t.created + interval '1 hour', $4, $5, $6::uuid, 10000, 5000, 3600000 FROM t
 		RETURNING id::text, to_char(deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`,
 		a.agency, mode, kind, lease, state, cycle).Scan(&r.id, &r.deadline))
 	t.Cleanup(func() {

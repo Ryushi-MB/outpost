@@ -93,8 +93,10 @@ func startGatedAPI(t *testing.T, requestTimeout time.Duration, delivery bool) *g
 		}
 		var r gatedRecord
 		require.NoError(t, admin.QueryRow(ctx, `
-			INSERT INTO outbound_start_records (org_id, mode, kind, created_at, deadline, lease_token, request_timeout_ms)
-			VALUES ($1, 'live', $2, clock_timestamp(), date_trunc('microseconds', clock_timestamp() + interval '1 hour'), $3, $4)
+			WITH t AS (SELECT date_trunc('microseconds', clock_timestamp()) AS created)
+			INSERT INTO outbound_start_records (org_id, mode, kind, created_at, deadline, lease_token, request_timeout_ms,
+			  transaction_timeout_ms, proxy_call_timeout_ms)
+			SELECT $1, 'live', $2, t.created, t.created + interval '1 hour', $3, $4, 5000, 3600000 FROM t
 			RETURNING id::text, to_char(deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`,
 			agency, kind, lease, requestTimeout.Milliseconds()).Scan(&r.id, &r.deadline))
 		made = append(made, r.id)
