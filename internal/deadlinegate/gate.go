@@ -70,6 +70,54 @@ var signedRoutes = []struct {
 
 var startRecordID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
+// WebhookType is the only destination type that may exist: every delivery must leave
+// through the egress proxy, and only the webhook provider uses it (Ospec
+// add-agency-api-access, "Webhook destinations are safe to reach").
+const WebhookType = "webhook"
+
+// typedRoutes are the signed routes whose body sets a destination's type. A create must
+// name webhook; an update may name no type, or webhook.
+var typedRoutes = []struct {
+	method       string
+	path         []string
+	typeRequired bool
+}{
+	{http.MethodPost, []string{"tenants", ":tenant", "destinations"}, true},
+	{http.MethodPatch, []string{"tenants", ":tenant", "destinations", ":id"}, false},
+}
+
+// destinationTypeAllowed reports whether the call leaves every destination a webhook. It
+// reads type with encoding/json into a struct, as Outpost's handlers bind it
+// (case-insensitive keys, the last one wins); a body that is not a JSON object is refused.
+func destinationTypeAllowed(r *http.Request, body []byte) bool {
+	segments := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/"), "/")
+	for _, route := range typedRoutes {
+		if route.method != r.Method || len(route.path) != len(segments) {
+			continue
+		}
+		matched := true
+		for i, want := range route.path {
+			if want[0] != ':' && want != segments[i] {
+				matched = false
+			}
+		}
+		if !matched {
+			continue
+		}
+		var v struct {
+			Type *string `json:"type"`
+		}
+		if err := json.Unmarshal(body, &v); err != nil {
+			return false
+		}
+		if v.Type == nil {
+			return !route.typeRequired
+		}
+		return *v.Type == WebhookType
+	}
+	return true
+}
+
 // Admission is what one signed call asks the database.
 type Admission struct {
 	StartRecordID string
@@ -309,6 +357,10 @@ func (g *Gate) Wrap(next http.Handler) http.Handler {
 		tenant, ok := tenantOf(r, body, h.kind)
 		if !ok {
 			refuse(w, http.StatusForbidden, "call kind not allowed on this route, or no tenant the gate can compare")
+			return
+		}
+		if !destinationTypeAllowed(r, body) {
+			refuse(w, http.StatusForbidden, "only webhook destinations are allowed")
 			return
 		}
 

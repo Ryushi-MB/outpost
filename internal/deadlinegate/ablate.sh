@@ -15,13 +15,13 @@ cd "$(dirname "$0")/../.."
 for v in MB_GATE_TEST_ADMIN_URL MB_GATE_TEST_GATE_URL MB_GATE_TEST_STANDBY_URL MB_GATE_TEST_GATE_TLS_URL; do
   [ -n "$(printenv "$v")" ] || { echo "ablate: set $v" >&2; exit 2; }
 done
-files=(internal/deadlinegate/gate.go internal/deadlinegate/admission.go internal/config/validation.go internal/services/builder.go internal/redis/fence.go internal/redis/redis.go)
+files=(internal/deadlinegate/gate.go internal/deadlinegate/admission.go internal/config/validation.go internal/services/builder.go internal/redis/fence.go internal/redis/redis.go internal/destregistry/providers/default.go)
 backup="$(mktemp -d)"
 for f in "${files[@]}"; do mkdir -p "$backup/$(dirname "$f")"; cp "$f" "$backup/$f"; done
 restore() { for f in "${files[@]}"; do cp "$backup/$f" "$f"; done; }
 trap restore EXIT
 
-pkgs=(./internal/deadlinegate ./internal/config ./internal/services ./internal/redis)
+pkgs=(./internal/deadlinegate ./internal/config ./internal/services ./internal/redis ./internal/destregistry/providers)
 go test -count=1 "${pkgs[@]}" >/dev/null || { echo "ablate: the tests are not green before ablation" >&2; exit 1; }
 
 failed=0
@@ -98,5 +98,8 @@ fence not tied to the cut-off|internal/redis/fence.go|./internal/redis|s/now\.Un
 unknown write passes under a fence|internal/redis/fence.go|./internal/redis|s/if !known \{/if false {/
 fence hook not installed|internal/redis/redis.go|./internal/redis|s/hooked\.AddHook\(fenceHook\{\}\)/_ = hooked/
 Redis ignores the call's deadline (ContextTimeoutEnabled)|internal/redis/redis.go|./internal/redis|s/\/\/ See createClusterClient\.\n\t\tContextTimeoutEnabled: true,\n//
+destination type not checked at the gate|internal/deadlinegate/gate.go|./internal/deadlinegate|s/if !destinationTypeAllowed\(r, body\) \{/if false {/
+destination type optional on create|internal/deadlinegate/gate.go|./internal/deadlinegate|s/return !route\.typeRequired/return true/
+a non-webhook provider registered|internal/destregistry/providers/default.go|./internal/destregistry/providers|s/registry\.RegisterProvider\("webhook", webhook\)/registry.RegisterProvider("webhook", webhook)\n\tregistry.RegisterProvider("rabbitmq", webhook)/
 MUTATIONS
 exit "$failed"

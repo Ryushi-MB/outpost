@@ -97,3 +97,29 @@ func TestRegisterDefault_WebhookCompatSignature(t *testing.T) {
 		assert.ErrorContains(t, err, "compat signature")
 	})
 }
+
+// MB Wallet's spec: every delivery leaves through the egress proxy, which only the webhook
+// provider uses, so webhook is the only destination type the service can resolve.
+func TestRegisterDefault_OnlyWebhook(t *testing.T) {
+	registry := destregistry.NewRegistry(&destregistry.Config{}, testutil.CreateTestLogger(t))
+	require.NoError(t, destregistrydefault.RegisterDefault(registry, destregistrydefault.RegisterDefaultDestinationOptions{
+		Webhook: &destregistrydefault.DestWebhookConfig{
+			HeaderPrefix:             destwebhook.DefaultHeaderPrefix,
+			SignatureContentTemplate: destwebhook.DefaultSignatureContentTmpl,
+			SignatureHeaderTemplate:  destwebhook.DefaultSignatureHeaderTmpl,
+			SignatureEncoding:        destwebhook.DefaultEncoding,
+			SignatureAlgorithm:       destwebhook.DefaultAlgorithm,
+			SigningSecretTemplate:    destwebhook.DefaultSigningSecretTmpl,
+		},
+		AWSEventBridge: &destregistrydefault.DestAWSEventBridgeConfig{Source: "outpost"},
+	}))
+	_, err := registry.ResolveProvider(&models.Destination{Type: "webhook"})
+	require.NoError(t, err)
+	// Every type upstream Outpost v1.6.0 registers besides webhook.
+	for _, typ := range []string{"hookdeck", "aws_sqs", "aws_eventbridge", "aws_kinesis", "aws_s3", "gcp_pubsub", "azure_servicebus", "rabbitmq", "kafka", "cloudflare_queues"} {
+		t.Run(typ, func(t *testing.T) {
+			_, err := registry.ResolveProvider(&models.Destination{Type: typ})
+			require.Error(t, err, "%s resolves to a provider", typ)
+		})
+	}
+}

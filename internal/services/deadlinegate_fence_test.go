@@ -217,3 +217,27 @@ func TestAGatedWriteCannotLandAfterTheCutOff(t *testing.T) {
 	require.True(t, ok, body["_raw"])
 	require.Empty(t, matched, "a publish after the cut-off reached the destination: %s", body["_raw"])
 }
+
+// Only a webhook destination may exist (every delivery leaves through the egress proxy):
+// through the built service, a signed create of every other upstream type is refused, and
+// a webhook create succeeds.
+func TestOnlyWebhookDestinationsCanBeCreated(t *testing.T) {
+	api := startGatedAPI(t, 2*time.Second)
+	base := "/api/v1/tenants/" + api.tenant
+	status, body := api.signed(t, "proxied_mutation", http.MethodPut, base, map[string]any{})
+	require.Contains(t, []int{http.StatusOK, http.StatusCreated}, status, body["_raw"])
+	for _, typ := range []string{"hookdeck", "aws_sqs", "aws_eventbridge", "aws_kinesis", "aws_s3", "gcp_pubsub", "azure_servicebus", "rabbitmq", "kafka", "cloudflare_queues"} {
+		t.Run(typ, func(t *testing.T) {
+			status, body := api.signed(t, "proxied_mutation", http.MethodPost, base+"/destinations", map[string]any{
+				"type": typ, "topics": []string{"user.created"}, "config": map[string]any{}, "credentials": map[string]any{},
+			})
+			require.Equal(t, http.StatusForbidden, status, body["_raw"])
+		})
+	}
+	status, body = api.signed(t, "proxied_mutation", http.MethodPost, base+"/destinations", map[string]any{
+		"type": "webhook", "topics": []string{"user.created"}, "config": map[string]any{"url": "https://hooks.example.com/mb"},
+	})
+	require.Equal(t, http.StatusCreated, status, body["_raw"])
+	status, body = api.signed(t, "proxied_mutation", http.MethodPatch, base+"/destinations/"+body["id"].(string), map[string]any{"type": "rabbitmq"})
+	require.Equal(t, http.StatusForbidden, status, body["_raw"])
+}

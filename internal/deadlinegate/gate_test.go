@@ -217,6 +217,22 @@ func TestGateRules(t *testing.T) {
 		{name: "GET carrying only a signature header", call: call{method: "GET", target: destPath, headers: map[string][]string{HeaderSignature: {"v1=00"}}}, decision: admitAll, want: refusedUnread},
 
 		// Validly signed but malformed: refused before any read.
+		// Only a webhook destination may exist: every delivery leaves through the egress
+		// proxy, which only the webhook provider uses. A create must name it; an update may
+		// name no type, or webhook. The body is read as Outpost's handlers bind it.
+		{name: "create a webhook destination", call: signed(keyCurrent, "POST", destPath, `{"type":"webhook","topics":"*","config":{"url":"https://hooks.example.com/mb"}}`, "proxied_mutation"), decision: admitAll, want: outcome{status: 200, reached: true, admitted: true}, tenant: tenant},
+		{name: "create a rabbitmq destination", call: signed(keyCurrent, "POST", destPath, `{"type":"rabbitmq","topics":"*","config":{"server_url":"amqp://x","exchange":"e"}}`, "proxied_mutation"), decision: admitAll, want: refusedUnread},
+		{name: "create with no type", call: signed(keyCurrent, "POST", destPath, `{"topics":"*"}`, "proxied_mutation"), decision: admitAll, want: refusedUnread},
+		{name: "create with type Webhook", call: signed(keyCurrent, "POST", destPath, `{"type":"Webhook","topics":"*"}`, "proxied_mutation"), decision: admitAll, want: refusedUnread},
+		{name: "create with a second type key that wins", call: signed(keyCurrent, "POST", destPath, `{"type":"webhook","type":"kafka","topics":"*"}`, "proxied_mutation"), decision: admitAll, want: refusedUnread},
+		{name: "create with an upper-case TYPE key", call: signed(keyCurrent, "POST", destPath, `{"type":"webhook","TYPE":"aws_sqs","topics":"*"}`, "proxied_mutation"), decision: admitAll, want: refusedUnread},
+		{name: "create with a body that is not an object", call: signed(keyCurrent, "POST", destPath, `["webhook"]`, "proxied_mutation"), decision: admitAll, want: refusedUnread},
+		{name: "update with no type", call: signed(keyCurrent, "PATCH", destPath+"/des_1", `{"topics":["a"]}`, "proxied_mutation"), decision: admitAll, want: outcome{status: 200, reached: true, admitted: true}, tenant: tenant},
+		{name: "update to webhook", call: signed(keyCurrent, "PATCH", destPath+"/des_1", `{"type":"webhook"}`, "proxied_mutation"), decision: admitAll, want: outcome{status: 200, reached: true, admitted: true}, tenant: tenant},
+		{name: "update to gcp_pubsub", call: signed(keyCurrent, "PATCH", destPath+"/des_1", `{"type":"gcp_pubsub"}`, "proxied_mutation"), decision: admitAll, want: refusedUnread},
+		{name: "update to an empty type", call: signed(keyCurrent, "PATCH", destPath+"/des_1", `{"type":""}`, "proxied_mutation"), decision: admitAll, want: refusedUnread},
+		{name: "update with a body that is not an object", call: signed(keyCurrent, "PATCH", destPath+"/des_1", `"x"`, "proxied_mutation"), decision: admitAll, want: refusedUnread},
+
 		{name: "unknown kind", call: signed(keyCurrent, "POST", "/api/v1/publish", publishBody, "publish_all"), decision: admitAll, want: refusedUnread},
 		{name: "kind in upper case", call: signed(keyCurrent, "POST", "/api/v1/publish", publishBody, "PUBLISH"), decision: admitAll, want: refusedUnread},
 		{name: "deadline without microseconds", call: func() call {
