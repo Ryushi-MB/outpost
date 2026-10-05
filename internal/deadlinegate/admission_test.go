@@ -97,6 +97,17 @@ func TestAdmissionRead(t *testing.T) {
 	t.Cleanup(func() {
 		_, _ = admin.Exec(ctx, "UPDATE stop_job_lease SET fencing_token = fencing_token + 1, holder = NULL, expires_at = NULL")
 	})
+	// A publish or redrive start record commits only under the publisher's current lease token
+	// (mb-wallet-neon drizzle/0354, outbound_start_records_recheck), so the fixture holds the
+	// publisher lease too. The gate never compares that lease; the cases below say so.
+	var publisherToken int64
+	if err := admin.QueryRow(ctx, `UPDATE publisher_lease SET fencing_token = fencing_token + 1, holder = 'admission-test',
+		expires_at = clock_timestamp() + interval '1 hour' RETURNING fencing_token`).Scan(&publisherToken); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec(ctx, "UPDATE publisher_lease SET expires_at = clock_timestamp() WHERE holder = 'admission-test'")
+	})
 	expireLease := func(t *testing.T) {
 		t.Helper()
 		if _, err := admin.Exec(ctx, "UPDATE stop_job_lease SET expires_at = clock_timestamp() - interval '1 second'"); err != nil {
@@ -149,7 +160,10 @@ func TestAdmissionRead(t *testing.T) {
 		if jobKind {
 			accessState, marker = r.accessState, r.marker
 		}
-		if r.kind != "proxied_mutation" && r.kind != "redrive" {
+		switch {
+		case r.kind == "publish" || r.kind == "redrive":
+			lease = publisherToken
+		case r.kind != "proxied_mutation":
 			lease = token
 		}
 		timeout := r.timeoutMs
