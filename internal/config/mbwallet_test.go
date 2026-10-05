@@ -22,6 +22,7 @@ func TestMBWalletSettingsAreRequiredAtStart(t *testing.T) {
 		"DESTINATIONS_PROXY_URL":                           "http://smokescreen:4750",
 		"DISABLE_TELEMETRY":                                "true",
 		"WEBHOOK_DEADLINE_GATE_ACCEPTANCE_RETENTION_HOURS": "720",
+		"DESTINATIONS_WEBHOOK_HEADER_PREFIX":               " ",
 	}
 	const unset = "\x00unset"
 	cases := []struct {
@@ -55,6 +56,10 @@ func TestMBWalletSettingsAreRequiredAtStart(t *testing.T) {
 		{"acceptance retention unset", map[string]string{"WEBHOOK_DEADLINE_GATE_ACCEPTANCE_RETENTION_HOURS": unset}, "WEBHOOK_DEADLINE_GATE_ACCEPTANCE_RETENTION_HOURS"},
 		{"acceptance retention one hour short of 30 days", map[string]string{"WEBHOOK_DEADLINE_GATE_ACCEPTANCE_RETENTION_HOURS": "719"}, "WEBHOOK_DEADLINE_GATE_ACCEPTANCE_RETENTION_HOURS"},
 		{"acceptance retention of the old 7 days", map[string]string{"WEBHOOK_DEADLINE_GATE_ACCEPTANCE_RETENTION_HOURS": "168"}, "WEBHOOK_DEADLINE_GATE_ACCEPTANCE_RETENTION_HOURS"},
+		{"header prefix unset (upstream default x-outpost-)", map[string]string{"DESTINATIONS_WEBHOOK_HEADER_PREFIX": unset}, "DESTINATIONS_WEBHOOK_HEADER_PREFIX"},
+		{"header prefix x-outpost-", map[string]string{"DESTINATIONS_WEBHOOK_HEADER_PREFIX": "x-outpost-"}, "DESTINATIONS_WEBHOOK_HEADER_PREFIX"},
+		{"header prefix Mb-", map[string]string{"DESTINATIONS_WEBHOOK_HEADER_PREFIX": "Mb-"}, "DESTINATIONS_WEBHOOK_HEADER_PREFIX"},
+		{"header prefix of tabs and spaces", map[string]string{"DESTINATIONS_WEBHOOK_HEADER_PREFIX": " 	 "}, ""},
 		{"acceptance retention negative", map[string]string{"WEBHOOK_DEADLINE_GATE_ACCEPTANCE_RETENTION_HOURS": "-720"}, "WEBHOOK_DEADLINE_GATE_ACCEPTANCE_RETENTION_HOURS"},
 	}
 	for _, tc := range cases {

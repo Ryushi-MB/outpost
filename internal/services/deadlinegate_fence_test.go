@@ -22,6 +22,7 @@ import (
 	"github.com/hookdeck/outpost/internal/deadlinegate"
 	"github.com/hookdeck/outpost/internal/infra"
 	"github.com/hookdeck/outpost/internal/logging"
+	"github.com/hookdeck/outpost/internal/migrator"
 	"github.com/hookdeck/outpost/internal/redis"
 	"github.com/hookdeck/outpost/internal/services"
 	"github.com/hookdeck/outpost/internal/telemetry"
@@ -38,6 +39,8 @@ const fenceSecret = "deadline-gate-fence-secret-0123456789abcdef"
 type gatedAPI struct {
 	addr    string
 	tenant  string
+	agency  string
+	admin   *pgxpool.Pool
 	records map[string]gatedRecord
 	link    *stallingLink // to Redis: holds the first write once stalled
 	rabbit  *stallingLink // to RabbitMQ: holds everything once stalled
@@ -73,7 +76,7 @@ func startGatedAPI(t *testing.T, requestTimeout time.Duration, delivery bool) *g
 	var token int64
 	require.NoError(t, admin.QueryRow(ctx, "SELECT fencing_token FROM stop_job_lease").Scan(&token))
 
-	api := &gatedAPI{tenant: agency + ":live", records: map[string]gatedRecord{}}
+	api := &gatedAPI{tenant: agency + ":live", agency: agency, admin: admin, records: map[string]gatedRecord{}}
 	var made []string
 	t.Cleanup(func() {
 		_, _ = admin.Exec(context.Background(), "DELETE FROM outbound_start_records WHERE id = ANY($1::uuid[])", made)
@@ -90,8 +93,10 @@ func startGatedAPI(t *testing.T, requestTimeout time.Duration, delivery bool) *g
 		}
 		var r gatedRecord
 		require.NoError(t, admin.QueryRow(ctx, `
-			INSERT INTO outbound_start_records (org_id, mode, kind, created_at, deadline, lease_token, request_timeout_ms)
-			VALUES ($1, 'live', $2, clock_timestamp(), date_trunc('microseconds', clock_timestamp() + interval '1 hour'), $3, $4)
+			WITH t AS (SELECT date_trunc('microseconds', clock_timestamp()) AS created)
+			INSERT INTO outbound_start_records (org_id, mode, kind, created_at, deadline, lease_token, request_timeout_ms,
+			  transaction_timeout_ms, proxy_call_timeout_ms)
+			SELECT $1, 'live', $2, t.created, t.created + interval '1 hour', $3, $4, 5000, 3600000 FROM t
 			RETURNING id::text, to_char(deadline AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`,
 			agency, kind, lease, requestTimeout.Milliseconds()).Scan(&r.id, &r.deadline))
 		made = append(made, r.id)
@@ -128,6 +133,13 @@ func startGatedAPI(t *testing.T, requestTimeout time.Duration, delivery bool) *g
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	c.MQs.RabbitMQ.Exchange, c.MQs.RabbitMQ.DeliveryQueue, c.MQs.RabbitMQ.LogQueue = "gate-"+suffix, "gate-delivery-"+suffix, "gate-log-"+suffix
 	require.NoError(t, c.Validate(config.Flags{}))
+	// Outpost's own log store schema, as "outpost migrate apply" gives a deployment: the
+	// retry path reads earlier attempts from it.
+	m, err := migrator.New(c.ToMigratorOpts())
+	require.NoError(t, err)
+	_, _, err = m.Up(context.Background(), -1)
+	require.NoError(t, err)
+	_, _ = m.Close(context.Background())
 	infraRedis, err := redis.New(context.Background(), c.Redis.ToConfig())
 	require.NoError(t, err)
 	t.Cleanup(func() { infraRedis.Close() })
@@ -163,13 +175,18 @@ func startGatedAPI(t *testing.T, requestTimeout time.Duration, delivery bool) *g
 // signed sends a call signed for the start record of kind, as MB Wallet's Worker does.
 func (a *gatedAPI) signed(t *testing.T, kind, method, target string, body any) (int, map[string]any) {
 	t.Helper()
+	return a.signedWith(t, a.records[kind], kind, method, target, body)
+}
+
+// signedWith sends a call signed for rec.
+func (a *gatedAPI) signedWith(t *testing.T, rec gatedRecord, kind, method, target string, body any) (int, map[string]any) {
+	t.Helper()
 	var raw []byte
 	if body != nil {
 		var err error
 		raw, err = json.Marshal(body)
 		require.NoError(t, err)
 	}
-	rec := a.records[kind]
 	req, err := http.NewRequest(method, a.addr+target, bytes.NewReader(raw))
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer apikey")

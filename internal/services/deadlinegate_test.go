@@ -31,6 +31,7 @@ func mbWalletSettings(t *testing.T, c *config.Config) {
 	c.DeliveryTimeoutSeconds = config.MBWalletDeliveryTimeoutSeconds
 	c.RetrySchedule = slices.Clone(config.MBWalletRetrySchedule)
 	c.Destinations.ProxyURL = proxychaintest.New(t, false).URL
+	c.Destinations.Webhook.HeaderPrefix = " "
 	c.Telemetry.Disabled = true
 	c.DeadlineGate.AcceptanceRetentionHours = 720
 }
