@@ -361,14 +361,15 @@ func TestMisc(t *testing.T) {
 			wantErr: config.ErrInvalidDestinationsProxyURL,
 		},
 		{
-			name: "publish proxy chain is valid",
+			// A well-formed publish queue is still refused: it would bypass the deadline gate.
+			name: "publish proxy chain is valid, but a publish queue is refused",
 			config: func() *config.Config {
 				c := validConfig()
 				c.PublishMQ.RabbitMQ.ServerURL = "amqp://broker:5672"
 				c.PublishMQ.ProxyURL = "http://user:pass@a:10000 https://b:8443"
 				return c
 			}(),
-			wantErr: nil,
+			wantErr: config.ErrPublishQueueBypassesGate,
 		},
 		{
 			name: "invalid publish proxy url",
@@ -574,6 +575,40 @@ func TestOpenTelemetry(t *testing.T) {
 			} else {
 				assert.NoError(t, err)
 			}
+		})
+	}
+}
+
+// Outpost refuses to start with a publish queue set: its consumer would publish events
+// around MB Wallet's deadline gate, which fronts the API's HTTP routes only.
+func TestPublishQueueIsRefusedAtStart(t *testing.T) {
+	base := map[string]string{
+		"POSTGRES_URL":          "postgres://postgres:postgres@localhost:5432/postgres",
+		"RABBITMQ_SERVER_URL":   "amqp://localhost:5672",
+		"AES_ENCRYPTION_SECRET": "secret",
+	}
+	cases := map[string]map[string]string{
+		"no publish queue":  nil,
+		"RabbitMQ":          {"PUBLISH_RABBITMQ_SERVER_URL": "amqp://localhost:5672", "PUBLISH_RABBITMQ_QUEUE": "publish"},
+		"AWS SQS":           {"PUBLISH_AWS_SQS_REGION": "us-east-1", "PUBLISH_AWS_SQS_QUEUE": "publish"},
+		"GCP Pub/Sub":       {"PUBLISH_GCP_PUBSUB_PROJECT": "p", "PUBLISH_GCP_PUBSUB_TOPIC": "t", "PUBLISH_GCP_PUBSUB_SUBSCRIPTION": "s"},
+		"Azure Service Bus": {"PUBLISH_AZURE_SERVICEBUS_CONNECTION_STRING": "Endpoint=sb://x/;SharedAccessKeyName=k;SharedAccessKey=v", "PUBLISH_AZURE_SERVICEBUS_TOPIC": "t", "PUBLISH_AZURE_SERVICEBUS_SUBSCRIPTION": "s"},
+	}
+	for name, publish := range cases {
+		t.Run(name, func(t *testing.T) {
+			env := map[string]string{}
+			for k, v := range base {
+				env[k] = v
+			}
+			for k, v := range publish {
+				env[k] = v
+			}
+			_, err := config.ParseWithOS(config.Flags{}, &mockOS{envVars: env})
+			if publish == nil {
+				assert.NoError(t, err)
+				return
+			}
+			assert.ErrorIs(t, err, config.ErrPublishQueueBypassesGate)
 		})
 	}
 }

@@ -59,6 +59,13 @@ func New(ctx context.Context, config *RedisConfig) (Client, error) {
 		return nil, err
 	}
 
+	// MB Wallet's write fence (fence.go): inert unless a call's context carries a fence.
+	hooked, ok := client.(interface{ AddHook(r.Hook) })
+	if !ok {
+		return nil, fmt.Errorf("redis: client %T takes no hooks, so the write fence cannot be installed", client)
+	}
+	hooked.AddHook(fenceHook{})
+
 	return client, nil
 }
 
@@ -68,7 +75,10 @@ func createClusterClient(ctx context.Context, config *RedisConfig) (Client, erro
 		Addrs:    []string{fmt.Sprintf("%s:%d", config.Host, config.Port)},
 		Username: config.Username,
 		Password: config.Password,
-		PoolSize: config.PoolSize,
+		// A command honours its context's deadline, so a gated call cut off by the deadline
+		// gate stops waiting on a stalled Redis instead of holding its goroutine.
+		ContextTimeoutEnabled: true,
+		PoolSize:              config.PoolSize,
 		// Note: Database is ignored in cluster mode
 	}
 
@@ -109,6 +119,8 @@ func createRegularClient(ctx context.Context, config *RedisConfig) (Client, erro
 		Password: config.Password,
 		DB:       config.Database,
 		PoolSize: config.PoolSize,
+		// See createClusterClient.
+		ContextTimeoutEnabled: true,
 	}
 
 	if config.TLSEnabled {

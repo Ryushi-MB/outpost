@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -160,8 +161,15 @@ func (c *Config) validatePublishMQ() error {
 	if c.PublishMaxRedeliveries < -1 {
 		return ErrInvalidPublishMaxRedeliveries
 	}
+	// MB Wallet's deadline gate fronts the API's HTTP routes. A publish queue would deliver
+	// publishes that never pass through it, so Outpost refuses to start with one.
+	if c.PublishMQ.GetQueueConfig() != nil {
+		return ErrPublishQueueBypassesGate
+	}
 	return nil
 }
+
+var ErrPublishQueueBypassesGate = errors.New("deadline gate: a publish queue would bypass the gate; unset the PUBLISH_* queue settings")
 
 // validateAESEncryptionSecret validates the AES encryption secret
 func (c *Config) validateAESEncryptionSecret() error {

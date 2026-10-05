@@ -11,6 +11,7 @@ import (
 	apirouter "github.com/hookdeck/outpost/internal/apirouter"
 	"github.com/hookdeck/outpost/internal/config"
 	"github.com/hookdeck/outpost/internal/consumer"
+	"github.com/hookdeck/outpost/internal/deadlinegate"
 	"github.com/hookdeck/outpost/internal/deliverymq"
 	"github.com/hookdeck/outpost/internal/destregistry"
 	destregistrydefault "github.com/hookdeck/outpost/internal/destregistry/providers"
@@ -78,6 +79,11 @@ func (b *ServiceBuilder) BuildWorkers() (*worker.WorkerSupervisor, error) {
 	serviceType := b.cfg.MustGetService()
 	b.logger.Debug("building workers for service type", zap.String("service_type", serviceType.String()))
 
+	// MB Wallet's delivery rules and egress (config.ValidateMBWallet), for every service type.
+	if err := b.cfg.ValidateMBWallet(); err != nil {
+		return nil, err
+	}
+
 	// Create base router with health check that all services will extend
 	b.logger.Debug("creating base router with health check")
 	baseRouter := NewBaseRouter(b.supervisor, b.cfg.GinMode, b.cfg.PprofEnabled)
@@ -117,6 +123,10 @@ func (b *ServiceBuilder) createHTTPServer(router http.Handler) error {
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%d", b.cfg.APIPort),
 		Handler: router,
+		// The deadline gate reads a call's whole body before it can check the signature.
+		// Bound that read in time as the gate bounds it in size: a call that cannot send
+		// its request within the gate's request timeout could not be admitted anyway.
+		ReadTimeout: time.Duration(b.cfg.DeadlineGate.RequestTimeoutMs) * time.Millisecond,
 	}
 
 	// Register HTTP server worker
@@ -186,6 +196,25 @@ func (b *ServiceBuilder) BuildAPIWorkers(baseRouter *gin.Engine) error {
 
 	// Initialize event handler and create API router
 	b.logger.Debug("creating event handler and API router")
+
+	// MB Wallet's deadline gate fronts the whole API. The publish queue consumer is gone:
+	// config validation refuses a publish queue, which would bypass the gate.
+	gateDB, err := deadlinegate.NewPG(b.ctx, b.cfg.DeadlineGate.DatabaseURL, b.cfg.DeadlineGate.LocalPlaintext)
+	if err != nil {
+		return err
+	}
+	svc.cleanupFuncs = append(svc.cleanupFuncs, func(ctx context.Context, logger *logging.LoggerWithCtx) { gateDB.Close() })
+	gate, err := deadlinegate.New(
+		b.cfg.DeadlineGate.Secret,
+		b.cfg.DeadlineGate.PreviousSecret,
+		time.Duration(b.cfg.DeadlineGate.RequestTimeoutMs)*time.Millisecond,
+		gateDB,
+		redis.Fencer{Client: svc.redisClient},
+	)
+	if err != nil {
+		return err
+	}
+
 	publishIdempotence := idempotence.New(svc.redisClient,
 		idempotence.WithTimeout(5*time.Second),
 		idempotence.WithSuccessfulTTL(time.Duration(b.cfg.PublishIdempotencyKeyTTL)*time.Second),
@@ -199,6 +228,7 @@ func (b *ServiceBuilder) BuildAPIWorkers(baseRouter *gin.Engine) error {
 		b.cfg.Topics,
 		b.cfg.TopicsAllowWildcards,
 		publishIdempotence,
+		publishmq.WithAcceptor(b.acceptances(svc.redisClient)),
 	)
 
 	// Create operator events emitter for subscription updates
@@ -233,7 +263,7 @@ func (b *ServiceBuilder) BuildAPIWorkers(baseRouter *gin.Engine) error {
 	)
 
 	// Mount API handler onto base router (everything except /healthz goes to apiHandler)
-	baseRouter.NoRoute(gin.WrapH(apiHandler))
+	baseRouter.NoRoute(gin.WrapH(gate.Wrap(apiHandler)))
 
 	svc.router = baseRouter
 
@@ -241,26 +271,6 @@ func (b *ServiceBuilder) BuildAPIWorkers(baseRouter *gin.Engine) error {
 	retryWorker := NewRetryMQWorker(svc.retryScheduler, b.logger)
 	_, retryRegisterOpts := restartOptions(b.cfg, config.SupervisorWorkerRetryMQ)
 	b.supervisor.Register(retryWorker, retryRegisterOpts...)
-
-	// Worker 2: PublishMQ Consumer (optional)
-	if publishQueueConfig := b.cfg.PublishMQ.GetQueueConfig(); publishQueueConfig != nil {
-		if b.cfg.PublishMQ.ProxyIgnored() {
-			b.logger.Info("PUBLISH_PROXY_URL is ignored: only the RabbitMQ publish queue connects through a proxy",
-				zap.String("publishmq_type", b.cfg.PublishMQ.GetInfraType()))
-		}
-		publishMQ := publishmq.New(publishmq.WithQueue(publishQueueConfig))
-		var messageHandlerOpts []publishmq.MessageHandlerOption
-		if b.cfg.PublishMaxRedeliveries >= 0 {
-			messageHandlerOpts = append(messageHandlerOpts, publishmq.WithMaxRedeliveries(
-				b.cfg.PublishMaxRedeliveries,
-				publishmq.NewRedisRedeliveryCounter(svc.redisClient, b.cfg.DeploymentID),
-			))
-		}
-		messageHandler := publishmq.NewMessageHandler(eventHandler, messageHandlerOpts...)
-		publishMQWorker, registerOpts := newSupervisedConsumerWorker(b.cfg, config.SupervisorWorkerPublishMQ,
-			"publishmq-consumer", publishMQ.Subscribe, messageHandler, b.cfg.PublishMaxConcurrency, b.logger)
-		b.supervisor.Register(publishMQWorker, registerOpts...)
-	}
 
 	b.logger.Info("API service workers built successfully")
 	return nil
@@ -354,6 +364,7 @@ func (b *ServiceBuilder) BuildDeliveryWorker(baseRouter *gin.Engine) error {
 		retryBackoff,
 		retryMaxLimit,
 		deliveryIdempotence,
+		deliverymq.WithAcceptance(b.acceptances(svc.redisClient)),
 	)
 
 	svc.router = baseRouter
@@ -656,4 +667,10 @@ func (s *serviceInstance) initRetryScheduler(ctx context.Context, cfg *config.Co
 	})
 	s.retryScheduler = retryScheduler
 	return nil
+}
+
+// acceptances reads and writes gated publishes' acceptance records, kept for the
+// configured acceptance retention after each call's cut-off.
+func (b *ServiceBuilder) acceptances(client redis.Client) redis.Acceptances {
+	return redis.Acceptances{Client: client, Retention: time.Duration(b.cfg.DeadlineGate.AcceptanceRetentionHours) * time.Hour}
 }

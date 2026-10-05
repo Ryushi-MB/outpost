@@ -43,6 +43,24 @@ type eventHandler struct {
 	tenantStore          tenantstore.TenantStore
 	topics               []string
 	topicsAllowWildcards bool
+	acceptor             Acceptor
+}
+
+// Acceptor marks a publish admitted by MB Wallet's deadline gate as accepted
+// (models.Acceptance): Pending is the acceptance its delivery tasks carry, nil for a call
+// without a fence; Accept writes the record once every task is enqueued, and fails once
+// the call's fence has passed.
+type Acceptor interface {
+	Pending(ctx context.Context) *models.Acceptance
+	Accept(ctx context.Context) error
+}
+
+type EventHandlerOption func(*eventHandler)
+
+// WithAcceptor makes a gated publish's deliveries depend on its acceptance record, so an
+// enqueue that lands after the call's cut-off delivers nothing.
+func WithAcceptor(a Acceptor) EventHandlerOption {
+	return func(h *eventHandler) { h.acceptor = a }
 }
 
 func NewEventHandler(
@@ -53,6 +71,7 @@ func NewEventHandler(
 	topics []string,
 	topicsAllowWildcards bool,
 	idempotence idempotence.Idempotence,
+	opts ...EventHandlerOption,
 ) EventHandler {
 	emeter, _ := emetrics.New()
 	eventHandler := &eventHandler{
@@ -64,6 +83,9 @@ func NewEventHandler(
 		topics:               topics,
 		topicsAllowWildcards: topicsAllowWildcards,
 		emeter:               emeter,
+	}
+	for _, opt := range opts {
+		opt(eventHandler)
 	}
 	return eventHandler
 }
@@ -182,10 +204,16 @@ func (h *eventHandler) doPublish(ctx context.Context, event *models.Event, match
 
 	h.emeter.EventEligbible(ctx, event)
 
+	var acceptance *models.Acceptance
+	if h.acceptor != nil {
+		acceptance = h.acceptor.Pending(ctx)
+	}
 	var g errgroup.Group
 	for _, destID := range matchedDestinations {
 		g.Go(func() error {
-			if err := h.enqueueDeliveryTask(ctx, models.NewDeliveryTask(*event, destID)); err != nil {
+			task := models.NewDeliveryTask(*event, destID)
+			task.Acceptance = acceptance
+			if err := h.enqueueDeliveryTask(ctx, task); err != nil {
 				return err
 			}
 			enqueuedMu.Lock()
@@ -197,6 +225,13 @@ func (h *eventHandler) doPublish(ctx context.Context, event *models.Event, match
 	if err := g.Wait(); err != nil {
 		span.RecordError(err)
 		return err
+	}
+	// Every task is enqueued: the call is accepted, unless its fence has passed.
+	if acceptance != nil {
+		if err := h.acceptor.Accept(ctx); err != nil {
+			span.RecordError(err)
+			return err
+		}
 	}
 	return nil
 }

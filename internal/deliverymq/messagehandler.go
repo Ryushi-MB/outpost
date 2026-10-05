@@ -74,6 +74,21 @@ type messageHandler struct {
 	retryMaxLimit  int
 	idempotence    idempotence.Idempotence
 	publisher      Publisher
+	acceptance     AcceptanceAwaiter
+}
+
+// AcceptanceAwaiter answers whether a gated publish was accepted (models.Acceptance),
+// waiting while that can still change.
+type AcceptanceAwaiter interface {
+	Await(ctx context.Context, acc models.Acceptance) (models.AcceptanceVerdict, error)
+}
+
+type MessageHandlerOption func(*messageHandler)
+
+// WithAcceptance delivers a task that carries an acceptance only once its publish is
+// accepted, and drops it when it never was. Without it such a task is never delivered.
+func WithAcceptance(a AcceptanceAwaiter) MessageHandlerOption {
+	return func(h *messageHandler) { h.acceptance = a }
 }
 
 type Publisher interface {
@@ -107,8 +122,9 @@ func NewMessageHandler(
 	retryBackoff backoff.Backoff,
 	retryMaxLimit int,
 	idempotence idempotence.Idempotence,
+	opts ...MessageHandlerOption,
 ) consumer.MessageHandler {
-	return &messageHandler{
+	h := &messageHandler{
 		eventTracer:    eventTracer,
 		logger:         logger,
 		logMQ:          logMQ,
@@ -119,6 +135,10 @@ func NewMessageHandler(
 		retryMaxLimit:  retryMaxLimit,
 		idempotence:    idempotence,
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 func (h *messageHandler) Handle(ctx context.Context, msg *mqs.Message) error {
@@ -126,6 +146,40 @@ func (h *messageHandler) Handle(ctx context.Context, msg *mqs.Message) error {
 
 	if err := task.FromMessage(msg); err != nil {
 		return h.handleError(msg, &PreDeliveryError{err: err})
+	}
+
+	// A task of a gated publish is delivered only if that publish was accepted before its
+	// cut-off; one enqueued by a call that never completed in time is dropped.
+	if task.Acceptance != nil {
+		verdict := models.NeverAccepted
+		if h.acceptance != nil {
+			var err error
+			if verdict, err = h.acceptance.Await(ctx, *task.Acceptance); err != nil {
+				return h.handleError(msg, &PreDeliveryError{err: err})
+			}
+		}
+		switch verdict {
+		case models.Accepted:
+		case models.RetentionPassed:
+			// The record may have been written and expired: a queue held this task past
+			// the acceptance retention. Dropping it could lose an accepted event outside
+			// the 30 days reconciliation looks back, so it is delivered. Delivery is at
+			// least once and partners deduplicate by Mb-Event-Id (Ospec
+			// add-agency-api-access, "Publishing never loses a committed event"); a
+			// disabled destination still gets nothing.
+			h.logger.Ctx(ctx).Error("delivery task past its acceptance retention: acceptance unknown, delivering",
+				zap.String("event_id", task.Event.ID),
+				zap.String("tenant_id", task.Event.TenantID),
+				zap.String("destination_id", task.DestinationID),
+				zap.Int64("acceptance_expires_us", task.Acceptance.Expires))
+		default:
+			h.logger.Ctx(ctx).Warn("delivery task dropped: its publish was not accepted before its cut-off",
+				zap.String("event_id", task.Event.ID),
+				zap.String("tenant_id", task.Event.TenantID),
+				zap.String("destination_id", task.DestinationID))
+			msg.Ack()
+			return nil
+		}
 	}
 
 	h.logger.Ctx(ctx).Debug("processing delivery task",

@@ -6,16 +6,6 @@ import (
 	"net/url"
 
 	"github.com/hookdeck/outpost/internal/destregistry"
-	"github.com/hookdeck/outpost/internal/destregistry/providers/destawseventbridge"
-	"github.com/hookdeck/outpost/internal/destregistry/providers/destawskinesis"
-	"github.com/hookdeck/outpost/internal/destregistry/providers/destawss3"
-	"github.com/hookdeck/outpost/internal/destregistry/providers/destawssqs"
-	"github.com/hookdeck/outpost/internal/destregistry/providers/destazureservicebus"
-	"github.com/hookdeck/outpost/internal/destregistry/providers/destcfqueues"
-	"github.com/hookdeck/outpost/internal/destregistry/providers/destgcppubsub"
-	"github.com/hookdeck/outpost/internal/destregistry/providers/desthookdeck"
-	"github.com/hookdeck/outpost/internal/destregistry/providers/destkafka"
-	"github.com/hookdeck/outpost/internal/destregistry/providers/destrabbitmq"
 	"github.com/hookdeck/outpost/internal/destregistry/providers/destwebhook"
 	"github.com/hookdeck/outpost/internal/emetrics"
 	"github.com/hookdeck/outpost/internal/proxychain"
@@ -77,9 +67,10 @@ type RegisterDefaultDestinationOptions struct {
 	DeliveryMaxConcurrency int
 }
 
-// RegisterDefault registers the default destination providers with the registry.
-// NOTE: The order of registration will determine the order of the provider array
-// returned when listing providers.
+// RegisterDefault registers the destination providers with the registry. MB Wallet's
+// build registers only webhook: its spec requires every delivery to leave through the
+// egress proxy, which only the webhook provider uses, so no other type may exist
+// (Ospec add-agency-api-access, "Webhook destinations are safe to reach").
 func RegisterDefault(registry destregistry.Registry, opts RegisterDefaultDestinationOptions) error {
 	loader := registry.MetadataLoader()
 
@@ -90,9 +81,8 @@ func RegisterDefault(registry destregistry.Registry, opts RegisterDefaultDestina
 	}
 
 	// Webhook destinations fan out across arbitrarily many hosts, so their pool
-	// needs breadth as well as depth. The hookdeck provider talks to one host.
+	// needs breadth as well as depth.
 	fanOutPool := destregistry.SizeFanOutPool(opts.DeliveryMaxConcurrency)
-	singleHostPool := destregistry.SizeSingleHostPool(opts.DeliveryMaxConcurrency)
 
 	emeter, err := emetrics.New()
 	if err != nil {
@@ -102,11 +92,6 @@ func RegisterDefault(registry destregistry.Registry, opts RegisterDefaultDestina
 		return func(reused bool) {
 			emeter.DeliveryConnection(context.Background(), reused, destinationType)
 		}
-	}
-
-	proxy, err := proxychain.Parse(opts.ProxyURL)
-	if err != nil {
-		return fmt.Errorf("destinations proxy: %w", err)
 	}
 
 	var webhookProxy []*url.URL
@@ -149,84 +134,6 @@ func RegisterDefault(registry destregistry.Registry, opts RegisterDefaultDestina
 		return err
 	}
 	registry.RegisterProvider("webhook", webhook)
-
-	hookdeck, err := desthookdeck.New(loader, basePublisherOpts,
-		desthookdeck.WithUserAgent(opts.UserAgent),
-		desthookdeck.WithConnectionPool(singleHostPool),
-		desthookdeck.WithConnectionObserver(connObserver("hookdeck")))
-	if err != nil {
-		return err
-	}
-	registry.RegisterProvider("hookdeck", hookdeck)
-
-	awsSQS, err := destawssqs.New(loader, basePublisherOpts)
-	if err != nil {
-		return err
-	}
-	registry.RegisterProvider("aws_sqs", awsSQS)
-
-	awsEventBridgeOpts := []destawseventbridge.Option{}
-	if opts.AWSEventBridge != nil {
-		awsEventBridgeOpts = append(awsEventBridgeOpts,
-			destawseventbridge.WithSource(opts.AWSEventBridge.Source),
-		)
-	}
-	awsEventBridge, err := destawseventbridge.New(loader, basePublisherOpts, awsEventBridgeOpts...)
-	if err != nil {
-		return err
-	}
-	registry.RegisterProvider("aws_eventbridge", awsEventBridge)
-
-	awsKinesisOpts := []destawskinesis.Option{}
-	if opts.AWSKinesis != nil {
-		awsKinesisOpts = append(awsKinesisOpts,
-			destawskinesis.WithMetadataInPayload(opts.AWSKinesis.MetadataInPayload),
-		)
-	}
-	awsKinesis, err := destawskinesis.New(loader, basePublisherOpts, awsKinesisOpts...)
-	if err != nil {
-		return err
-	}
-	registry.RegisterProvider("aws_kinesis", awsKinesis)
-
-	awsS3, err := destawss3.New(loader, basePublisherOpts)
-	if err != nil {
-		return err
-	}
-	registry.RegisterProvider("aws_s3", awsS3)
-
-	gcpPubSub, err := destgcppubsub.New(loader, basePublisherOpts)
-	if err != nil {
-		return err
-	}
-	registry.RegisterProvider("gcp_pubsub", gcpPubSub)
-
-	azureServiceBus, err := destazureservicebus.New(loader, basePublisherOpts)
-	if err != nil {
-		return err
-	}
-	registry.RegisterProvider("azure_servicebus", azureServiceBus)
-
-	rabbitmq, err := destrabbitmq.New(loader, basePublisherOpts, destrabbitmq.WithProxy(proxy))
-	if err != nil {
-		return err
-	}
-	registry.RegisterProvider("rabbitmq", rabbitmq)
-
-	kafkaDest, err := destkafka.New(loader, basePublisherOpts, destkafka.WithProxy(proxy))
-	if err != nil {
-		return err
-	}
-	registry.RegisterProvider("kafka", kafkaDest)
-
-	cloudflareQueues, err := destcfqueues.New(loader, basePublisherOpts,
-		destcfqueues.WithUserAgent(opts.UserAgent),
-		destcfqueues.WithConnectionPool(singleHostPool),
-		destcfqueues.WithConnectionObserver(connObserver("cloudflare_queues")))
-	if err != nil {
-		return err
-	}
-	registry.RegisterProvider("cloudflare_queues", cloudflareQueues)
 
 	return nil
 }

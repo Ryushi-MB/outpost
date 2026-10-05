@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -960,6 +961,9 @@ func TestWebhookPublisher_HTTPErrors(t *testing.T) {
 		statusCode int
 	}{
 		{"400 Bad Request", 400},
+		// Only a 2xx acknowledges (Ospec add-agency-api-access, delivery rules).
+		{"300 Multiple Choices", 300},
+		{"304 Not Modified", 304},
 		{"401 Unauthorized", 401},
 		{"403 Forbidden", 403},
 		{"404 Not Found", 404},
@@ -1009,6 +1013,46 @@ func TestWebhookPublisher_HTTPErrors(t *testing.T) {
 			require.NotNil(t, delivery, "delivery should NOT be nil for HTTP errors")
 			assert.Equal(t, "failed", delivery.Status)
 			assert.Equal(t, fmt.Sprintf("%d", tt.statusCode), delivery.Code)
+		})
+	}
+}
+
+// A redirect is never followed and is a failed attempt (Ospec add-agency-api-access,
+// "Delivery retries last at least three days"): the target named in Location receives
+// nothing, and the attempt records the 3xx.
+func TestWebhookPublisher_RedirectIsAFailedAttempt(t *testing.T) {
+	t.Parallel()
+	for _, code := range []int{301, 302, 303, 307, 308} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			t.Parallel()
+			var targetHits atomic.Int32
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				targetHits.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer target.Close()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL+"/elsewhere", code)
+			}))
+			defer server.Close()
+
+			provider := NewTestProvider(t)
+			destination := testutil.DestinationFactory.Any(
+				testutil.DestinationFactory.WithType("webhook"),
+				testutil.DestinationFactory.WithConfig(map[string]string{"url": server.URL + "/webhook"}),
+				testutil.DestinationFactory.WithCredentials(map[string]string{"secret": "test-secret"}),
+			)
+			publisher, err := provider.CreatePublisher(context.Background(), &destination)
+			require.NoError(t, err)
+			defer publisher.Close()
+			event := testutil.EventFactory.Any(testutil.EventFactory.WithDataMap(map[string]interface{}{"key": "value"}))
+
+			delivery, err := publisher.Publish(context.Background(), &event)
+			require.Error(t, err)
+			require.NotNil(t, delivery)
+			assert.Equal(t, "failed", delivery.Status)
+			assert.Equal(t, fmt.Sprint(code), delivery.Code)
+			assert.Zero(t, targetHits.Load(), "the redirect was followed")
 		})
 	}
 }

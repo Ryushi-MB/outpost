@@ -47,7 +47,12 @@ func (c HTTPClientConfig) needsTransport() bool {
 // NewHTTPClient builds an *http.Client from config. Free function — no
 // provider state is involved.
 func NewHTTPClient(config HTTPClientConfig) (*http.Client, error) {
-	client := &http.Client{}
+	// A redirect is never followed: the 3xx itself is the response, and the publisher
+	// counts it as a failed attempt. Following one would deliver to a host the destination
+	// never named (Ospec add-agency-api-access, "Webhook destinations are safe to reach").
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 
 	if config.Timeout != nil {
 		client.Timeout = *config.Timeout
