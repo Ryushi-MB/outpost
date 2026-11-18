@@ -23,17 +23,23 @@ import (
 // fencing token, and that lease not yet expired by the database clock (a runner whose lease
 // lapsed before D is no longer the stop job). The lease columns need SELECT (fencing_token,
 // expires_at) for the gate role. A replica answers false. Any other outcome refuses the call.
+//
+// MB Wallet MB-1030 (mb-wallet-neon drizzle/1362): webhooks are split by API service. A start
+// record carries its product; a pay_in call acts on the tenant "<agency>:<mode>:pay_in" and its
+// condition is pay-in on for the agency in that mode (payin_settings.enabled), not payout API
+// access. A payouts call is exactly as before. The gate role holds SELECT (product) on
+// outbound_start_records and SELECT (org_id, mode, enabled) on payin_settings.
 const admitSQL = `
 SELECT COALESCE(
          NOT pg_is_in_recovery()
          AND s.kind = $2
          AND s.deadline = $3::timestamptz
-         AND s.org_id::text || ':' || s.mode = $4
+         AND s.org_id::text || ':' || s.mode || CASE WHEN s.product = 'pay_in' THEN ':pay_in' ELSE '' END = $4
          AND s.ended_at IS NULL
          AND clock_timestamp() < s.deadline
          AND CASE
                WHEN s.kind IN ('publish', 'redrive', 'republish', 'proxied_mutation')
-                 THEN a.state = 'on'
+                 THEN CASE WHEN s.product = 'pay_in' THEN coalesce(p.enabled, false) ELSE a.state = 'on' END
                WHEN s.kind IN ('job_disable', 'job_list', 'job_enable')
                  THEN a.state = s.access_state
                   AND a.cycle_marker = s.cycle_marker
@@ -45,6 +51,7 @@ SELECT COALESCE(
        s.request_timeout_ms
   FROM outbound_start_records s
   LEFT JOIN agency_api_access a ON a.org_id = s.org_id
+  LEFT JOIN payin_settings p ON p.org_id = s.org_id AND p.mode = s.mode
   LEFT JOIN stop_job_lease l ON true
  WHERE s.id = $1::uuid`
 
